@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Twitter Scraper",
+  "version": "1.0.0",
+  "description": "Scrapes Twitter profiles and exports to Obsidian markdown",
+  "host_permissions": ["https://*.twitter.com/*", "https://*.x.com/*"],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.twitter.com/*/with_replies",
+        "https://*.x.com/*/with_replies",
+        "https://*.twitter.com/*/status/*",
+        "https://*.twitter.com/i/web/status/*",
+        "https://*.x.com/*/status/*",
+        "https://*.x.com/i/web/status/*"
+      ],
+      "js": ["scraper.js", "exporter.js", "ui.js", "main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
