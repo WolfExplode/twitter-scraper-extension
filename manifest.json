@@ -12,7 +12,11 @@
         "https://*.twitter.com/*/status/*",
         "https://*.twitter.com/i/web/status/*",
         "https://*.x.com/*/status/*",
-        "https://*.x.com/i/web/status/*"
+        "https://*.x.com/i/web/status/*",
+        "https://*.twitter.com/search*",
+        "https://*.x.com/search*",
+        "https://*.twitter.com/search-advanced*",
+        "https://*.x.com/search-advanced*"
       ],
       "js": ["scraper.js", "exporter.js", "ui.js", "main.js"],
       "run_at": "document_start",

@@ -329,6 +329,38 @@ stopButton.style.cssText = 'padding:8px;background:#e0245e;color:white;border:no
 stopButton.onclick = stopAndDownload;
 uiContainer.appendChild(stopButton);
 
+const exportSearchMediaBtn = document.createElement('button');
+exportSearchMediaBtn.textContent = 'Download search media lists';
+exportSearchMediaBtn.style.cssText = 'padding:8px;background:#0f766e;color:white;border:none;border-radius:4px;cursor:pointer;';
+exportSearchMediaBtn.onclick = () => {
+    try {
+        const agg = typeof loadSearchAggregate === 'function' ? loadSearchAggregate() : null;
+        if (!agg || !Array.isArray(agg.tweets) || agg.tweets.length === 0) {
+            setUiStatus('No aggregated search media to export yet.');
+            return;
+        }
+        const ownerHandle = agg.ownerHandle || '';
+        const keySource = ownerHandle || agg.exportKey || 'account';
+        const account = typeof handleToExportKey === 'function' ? handleToExportKey(keySource) : keySource;
+
+        // Export a single combined set of avatar + voice media helpers for the whole search run.
+        if (typeof exportVoiceTweetUrlListFile === 'function' && typeof exportVoiceYtDlp !== 'undefined' && exportVoiceYtDlp) {
+            try { exportVoiceTweetUrlListFile(agg.tweets, account); } catch { /* ignore */ }
+        }
+        if (typeof exportAvatarDownloadFiles === 'function') {
+            try { exportAvatarDownloadFiles(agg.tweets, account); } catch { /* ignore */ }
+        }
+        if (typeof exportCombinedDownloadMediaRunner === 'function') {
+            try { exportCombinedDownloadMediaRunner(account); } catch { /* ignore */ }
+        }
+
+        setUiStatus(`Exported search media lists from ${agg.tweets.length} tweets.`);
+    } catch {
+        setUiStatus('Failed to export aggregated search media lists.');
+    }
+};
+uiContainer.appendChild(exportSearchMediaBtn);
+
 waitForBodyReady().then(() => {
     // Avoid duplicate UI if X's SPA re-injects the script in some edge cases.
     if (!document.getElementById('wxp-scraper-status')) {
@@ -337,6 +369,27 @@ waitForBodyReady().then(() => {
     if (highlightScrapedEnabled) {
         highlightAllScrapedTweets();
         startScrapedHighlightObserver();
+    }
+    // If we are on a status page as part of an active search run, auto-start scraping.
+    try {
+        const ctx = computeRunContextFromCurrentPage?.();
+        if (ctx && ctx.mode === 'status') {
+            const state = loadSearchRunState?.();
+            if (state && !state.done && Array.isArray(state.tweetQueue) && state.tweetQueue.length > 0) {
+                const currentUrl = normalizeStatusUrl(window.location?.href || '');
+                const idx = Number.isFinite(state.currentIndex) ? state.currentIndex | 0 : 0;
+                const target = state.tweetQueue[idx] || state.tweetQueue.find(u => normalizeStatusUrl(u) === currentUrl);
+                if (target && normalizeStatusUrl(target) === currentUrl) {
+                    // Auto-start only once per page to avoid accidental double runs.
+                    if (!window.__wxp_auto_started_search_status) {
+                        window.__wxp_auto_started_search_status = true;
+                        startScraping();
+                    }
+                }
+            }
+        }
+    } catch {
+        // ignore auto-start errors
     }
 }).catch(() => {
     // As a last resort, try append immediately.

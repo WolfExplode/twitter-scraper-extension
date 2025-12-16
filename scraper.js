@@ -63,6 +63,9 @@
     function getPageModeFromLocation() {
         const path = String(window.location?.pathname || '');
         if (/\/with_replies\/?$/i.test(path)) return 'with_replies';
+        // Search results and advanced search builder
+        if (/^\/search-advanced\/?/i.test(path)) return 'search_advanced';
+        if (/^\/search\/?/i.test(path)) return 'search';
         // For tweet pages, URL patterns can be:
         // - /<user>/status/<id>
         // - /i/web/status/<id>
@@ -84,6 +87,33 @@
         return h ? h.replace(/[^a-z0-9_-]/gi, '_') : 'account';
     }
 
+    function inferSearchOwnerHandleFromUrlOrDom() {
+        // Try to infer the profile handle from the search query (?q=from:handle …).
+        try {
+            const href = window.location?.href || '';
+            const u = new URL(href, window.location.origin);
+            const rawQ = u.searchParams.get('q') || '';
+            const decoded = decodeURIComponent(rawQ);
+            const m = decoded.match(/from(?::|%3A)([A-Za-z0-9_]{1,15})/i);
+            if (m && m[1]) {
+                return '@' + m[1];
+            }
+        } catch {
+            // ignore and fall back to DOM
+        }
+
+        // Fallback: first tweet's handle in the results list.
+        try {
+            const handleSpan = document.querySelector('article[data-testid="tweet"] div[data-testid="User-Name"] a[tabindex="-1"] span');
+            const txt = handleSpan?.innerText || handleSpan?.textContent || '';
+            if (txt.trim()) return txt.trim();
+        } catch {
+            // ignore
+        }
+
+        return '';
+    }
+
     function computeRunContextFromCurrentPage() {
         const mode = getPageModeFromLocation();
         if (mode === 'with_replies') {
@@ -103,6 +133,16 @@
                 profileHandle: '',
                 exportKey: 'status',
                 rootRestId: restId
+            };
+        }
+
+        if (mode === 'search' || mode === 'search_advanced') {
+            const ph = inferSearchOwnerHandleFromUrlOrDom();
+            return {
+                mode,
+                profileHandle: ph,
+                exportKey: handleToExportKey(ph),
+                rootRestId: ''
             };
         }
 
@@ -437,8 +477,148 @@
         exportVoiceYtDlp: 'wxp_tw_scraper_export_voice_ytdlp',
         ytDlpCookiesBrowser: 'wxp_tw_scraper_ytdlp_cookies_browser',
         rememberScrapedIdsEnabled: 'wxp_tw_scraper_remember_scraped_ids_enabled',
-        rememberedScrapedIds: 'wxp_tw_scraper_remembered_scraped_ids_v1'
+        rememberedScrapedIds: 'wxp_tw_scraper_remembered_scraped_ids_v1',
+        searchRunState: 'wxp_tw_scraper_search_run_state_v1',
+        searchAggregate: 'wxp_tw_scraper_search_aggregate_v1'
     };
+
+    // Cross-page search run coordination (search results -> status pages -> back)
+    function loadSearchRunState() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEYS.searchRunState);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') return null;
+            if (!Array.isArray(parsed.tweetQueue)) parsed.tweetQueue = [];
+            parsed.currentIndex = Number.isFinite(parsed.currentIndex) ? parsed.currentIndex | 0 : 0;
+            return parsed;
+        } catch {
+            return null;
+        }
+    }
+
+    function saveSearchRunState(state) {
+        if (!state) return;
+        try {
+            const payload = {
+                version: 1,
+                mode: state.mode || 'search',
+                searchUrl: state.searchUrl || '',
+                exportKey: state.exportKey || 'account',
+                ownerHandle: state.ownerHandle || '',
+                tweetQueue: Array.isArray(state.tweetQueue) ? state.tweetQueue : [],
+                currentIndex: Number.isFinite(state.currentIndex) ? state.currentIndex | 0 : 0,
+                startedAt: state.startedAt || new Date().toISOString(),
+                done: !!state.done
+            };
+            localStorage.setItem(STORAGE_KEYS.searchRunState, JSON.stringify(payload));
+        } catch {
+            // ignore
+        }
+    }
+
+    function clearSearchRunState() {
+        try {
+            localStorage.removeItem(STORAGE_KEYS.searchRunState);
+        } catch {
+            // ignore
+        }
+    }
+
+    // Aggregated media data across a search run (for single *_avatars.tsv + *_download_media.cmd export)
+    function loadSearchAggregate() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEYS.searchAggregate);
+            if (!raw) {
+                return { exportKey: '', ownerHandle: '', tweets: [] };
+            }
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') {
+                return { exportKey: '', ownerHandle: '', tweets: [] };
+            }
+            if (!Array.isArray(parsed.tweets)) parsed.tweets = [];
+            return parsed;
+        } catch {
+            return { exportKey: '', ownerHandle: '', tweets: [] };
+        }
+    }
+
+    function saveSearchAggregate(agg) {
+        if (!agg) return;
+        try {
+            const payload = {
+                exportKey: agg.exportKey || '',
+                ownerHandle: agg.ownerHandle || '',
+                tweets: Array.isArray(agg.tweets) ? agg.tweets : []
+            };
+            localStorage.setItem(STORAGE_KEYS.searchAggregate, JSON.stringify(payload));
+        } catch {
+            // ignore (quota etc.)
+        }
+    }
+
+    function clearSearchAggregate() {
+        try {
+            localStorage.removeItem(STORAGE_KEYS.searchAggregate);
+        } catch {
+            // ignore
+        }
+    }
+
+    function getNormalizedCurrentStatusUrl() {
+        return normalizeStatusUrl(window.location?.href || '');
+    }
+
+    function collectSearchResultTweetUrls(max = 5000) {
+        const urls = [];
+        const seen = new Set();
+        const articles = document.querySelectorAll('article[data-testid="tweet"]');
+        for (let i = 0; i < articles.length && urls.length < max; i++) {
+            const a = articles[i].querySelector('a[href*="/status/"]');
+            const id = normalizeStatusUrl(a?.href || '');
+            if (!id) continue;
+            if (scrapedIdSet.has(id) || rememberedScrapedIdSet.has(id)) continue;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            urls.push(id);
+        }
+        return urls;
+    }
+
+    async function collectAllSearchResultTweetUrlsWithScroll() {
+        const all = new Set();
+        let lastSize = 0;
+        let stalledTicks = 0;
+        const maxTicks = 200;
+
+        for (let tick = 0; tick < maxTicks; tick++) {
+            const batch = collectSearchResultTweetUrls();
+            for (const id of batch) {
+                all.add(id);
+            }
+
+            if (all.size > lastSize) {
+                lastSize = all.size;
+                stalledTicks = 0;
+            } else {
+                stalledTicks++;
+            }
+
+            if (isEndOfTimelineVisible()) break;
+            if (stalledTicks >= 5) break;
+
+            const beforeY = window.scrollY;
+            window.scrollBy(0, getScrapeScrollStepPx());
+            const afterY = window.scrollY;
+            if (afterY === beforeY) {
+                stalledTicks++;
+            }
+
+            await sleep(SCRAPE_TICK_MS);
+        }
+
+        return Array.from(all);
+    }
 
     // Optional: drive the TwitterMediaHarvest extension by auto-clicking its injected button.
     // This avoids re-implementing downloads in this userscript and lets the extension manage history/filenames.
@@ -1691,6 +1871,43 @@
         }
     }
 
+    async function startSearchRunFromSearchPage(ctx) {
+        try {
+            applyScrapePageZoom();
+        } catch {
+            // ignore
+        }
+
+        setUiStatus('Collecting tweets from search results…');
+        const tweetQueue = await collectAllSearchResultTweetUrlsWithScroll();
+        const filteredQueue = tweetQueue.filter(id => !scrapedIdSet.has(id) && !rememberedScrapedIdSet.has(id));
+
+        if (!filteredQueue.length) {
+            setUiStatus('Search run: no new tweets found (all already scraped or none visible).');
+            resetPageZoomTo100();
+            return;
+        }
+
+        // Fresh aggregate for this search run (previous data is discarded).
+        clearSearchAggregate();
+
+        const state = {
+            mode: 'search',
+            searchUrl: window.location?.href || '',
+            exportKey: ctx.exportKey || 'account',
+            ownerHandle: ctx.profileHandle || '',
+            tweetQueue: filteredQueue,
+            currentIndex: 0,
+            startedAt: new Date().toISOString(),
+            done: false
+        };
+        saveSearchRunState(state);
+
+        const first = filteredQueue[0];
+        setUiStatus(`Search run: ${filteredQueue.length} tweets queued. Opening 1/${filteredQueue.length}…`);
+        window.location.href = first;
+    }
+
     function startScraping() {
         // Compute context at start time (X is an SPA; pathname/URL can change without a reload).
         const ctx = computeRunContextFromCurrentPage();
@@ -1698,6 +1915,13 @@
         currentRunProfileHandle = ctx.profileHandle;
         currentRunExportKey = ctx.exportKey;
         currentRunRootStatusRestId = ctx.rootRestId;
+
+        // Special handling: search results / advanced search acts as controller that walks each status page.
+        if (currentRunMode === 'search' || currentRunMode === 'search_advanced') {
+            // Avoid starting the legacy timeline-based scraper on search pages.
+            startSearchRunFromSearchPage(ctx);
+            return;
+        }
 
         loadHighlightScrapedSetting();
         highlightAllScrapedTweets();
@@ -1797,7 +2021,8 @@
 
                     // If Twitter isn't loading new tweet DOM nodes, PAUSE and give it a chance to load more.
                     // Only stop+download if it stays stuck for the full wait window.
-                    if (stalledScroll && consecutiveNoNewTicks >= 2 && noNewTimelineElsRecently) {
+                    // This heuristic is only useful on scrolling timelines (e.g. /with_replies), not on single /status pages.
+                    if (currentRunMode === 'with_replies' && stalledScroll && consecutiveNoNewTicks >= 2 && noNewTimelineElsRecently) {
                         setUiStatus(`Paused: waiting for Twitter to load more… (up to ${Math.round(TIMELINE_LOAD_WAIT_MS / 1000)}s)`);
                         const didLoad = await waitForTimelineActivity(TIMELINE_LOAD_WAIT_MS);
                         if (didLoad) {
@@ -1957,6 +2182,75 @@
         return { deferredCount };
     }
 
+    function mergeTweetsIntoSearchAggregate(scrapedTweets, searchState, exportKey) {
+        if (!Array.isArray(scrapedTweets) || scrapedTweets.length === 0) return;
+        const agg = loadSearchAggregate();
+        if (!agg.tweets) agg.tweets = [];
+
+        // Prefer explicit exportKey from search state when present.
+        const key = (searchState?.exportKey || exportKey || agg.exportKey || 'account');
+        const owner = searchState?.ownerHandle || agg.ownerHandle || '';
+
+        agg.exportKey = key;
+        agg.ownerHandle = owner;
+
+        // We can simply append; the downstream avatar/voice exporters are already de-duplicated.
+        for (const t of scrapedTweets) {
+            if (t && t.id) {
+                agg.tweets.push({
+                    id: t.id,
+                    authorHandle: t.authorHandle || '',
+                    authorAvatarUrl: t.authorAvatarUrl || '',
+                    authorAvatarFile: t.authorAvatarFile || '',
+                    isVoicePost: !!t.isVoicePost
+                });
+            }
+        }
+
+        saveSearchAggregate(agg);
+    }
+
+    function advanceSearchRunAfterDownload() {
+        const state = loadSearchRunState();
+        if (!state || !Array.isArray(state.tweetQueue) || state.done) return;
+
+        const currentUrl = getNormalizedCurrentStatusUrl();
+        let idx = state.currentIndex | 0;
+        if (idx < 0) idx = 0;
+
+        // Ensure currentIndex at least points past the just-processed tweet.
+        if (state.tweetQueue[idx] && normalizeStatusUrl(state.tweetQueue[idx]) === currentUrl) {
+            idx++;
+        } else {
+            // Try to find currentUrl in the queue as a fallback.
+            const found = state.tweetQueue.findIndex(u => normalizeStatusUrl(u) === currentUrl);
+            if (found >= 0) idx = found + 1;
+        }
+
+        if (idx >= state.tweetQueue.length) {
+            state.done = true;
+            state.currentIndex = state.tweetQueue.length;
+            saveSearchRunState(state);
+            // When finished, navigate back to the original search page if we have it.
+            if (state.searchUrl) {
+                setUiStatus('Search run completed. Returning to search page…');
+                window.location.href = state.searchUrl;
+            } else {
+                setUiStatus('Search run completed.');
+            }
+            return;
+        }
+
+        state.currentIndex = idx;
+        saveSearchRunState(state);
+
+        const next = state.tweetQueue[idx];
+        if (next) {
+            setUiStatus(`Search run: opening ${idx + 1}/${state.tweetQueue.length}…`);
+            window.location.href = next;
+        }
+    }
+
     function stopAndDownload() {
         // If a download has already been triggered for this run (whether via auto-stop
         // or a previous manual click), do nothing. This prevents the "double download"
@@ -2036,12 +2330,25 @@
             console.log(`Processed status page (${safeRestId}). Tweets: ${scrapedData.length}, Threads: ${threads.length || 0}.`);
             generateMarkdown(finalSequence, filename);
 
-            // Exports (avatars, voice) use root author's handle for consistent naming.
-            if (exportVoiceYtDlp) {
-                try { exportVoiceTweetUrlListFile(scrapedData, exportKey); } catch { /* ignore */ }
+            // If we are in the middle of a search run, aggregate media-only data into localStorage
+            // and defer avatars/yt-dlp/export scripts to a single combined export later.
+            const searchState = loadSearchRunState();
+            const isPartOfSearchRun = !!(searchState && !searchState.done && searchState.mode === 'search');
+
+            if (isPartOfSearchRun) {
+                try {
+                    mergeTweetsIntoSearchAggregate(scrapedData, searchState, exportKey);
+                } catch {
+                    // ignore aggregation errors; scraping result is still saved via markdown
+                }
+            } else {
+                // Standalone status page: export avatars + voice media helpers immediately.
+                if (exportVoiceYtDlp) {
+                    try { exportVoiceTweetUrlListFile(scrapedData, exportKey); } catch { /* ignore */ }
+                }
+                try { exportAvatarDownloadFiles(scrapedData, exportKey); } catch { /* ignore */ }
+                try { exportCombinedDownloadMediaRunner(exportKey); } catch { /* ignore */ }
             }
-            try { exportAvatarDownloadFiles(scrapedData, exportKey); } catch { /* ignore */ }
-            try { exportCombinedDownloadMediaRunner(exportKey); } catch { /* ignore */ }
 
             if (highlightScrapedEnabled) {
                 highlightAllScrapedTweets();
@@ -2049,6 +2356,11 @@
 
             resetPageZoomTo100();
             setUiStatus(`Downloaded. ${formatStartTweetStatus()}`);
+
+            if (isPartOfSearchRun) {
+                // If this status page is part of an active search run, continue to the next tweet.
+                advanceSearchRunAfterDownload();
+            }
             return;
         }
 
