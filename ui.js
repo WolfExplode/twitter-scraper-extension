@@ -134,9 +134,22 @@ clearIdsBtn.onclick = () => {
     setUiStatus('Cleared remembered scraped IDs.');
 };
 
+const clearPageIdsBtn = document.createElement('button');
+clearPageIdsBtn.textContent = 'Clear IDs (this page only)';
+clearPageIdsBtn.style.cssText = 'padding:6px 8px;background:#f97316;color:white;border:none;border-radius:4px;cursor:pointer;font:12px system-ui, -apple-system, Segoe UI, Roboto, Arial;';
+clearPageIdsBtn.onclick = () => {
+    if (typeof clearRememberedScrapedIdsForCurrentPage === 'function') {
+        clearRememberedScrapedIdsForCurrentPage();
+        updateRememberCount();
+    } else {
+        setUiStatus('Per-page ID clearing is not available in this build.');
+    }
+};
+
 rememberButtonsRow.appendChild(exportIdsBtn);
 rememberButtonsRow.appendChild(importIdsBtn);
 rememberButtonsRow.appendChild(clearIdsBtn);
+rememberButtonsRow.appendChild(clearPageIdsBtn);
 rememberButtonsRow.appendChild(importInput);
 uiContainer.appendChild(rememberButtonsRow);
 
@@ -315,19 +328,113 @@ autoScrollStatus.textContent = 'Auto-scroll: idle.';
 uiContainer.appendChild(autoScrollStatus);
 
 const startButton = document.createElement('button');
-startButton.textContent = 'Start Scraping';
 startButton.style.cssText = 'padding:8px;background:#1da1f2;color:white;border:none;border-radius:4px;cursor:pointer;';
-startButton.onclick = () => {
-    stopAutoScrollToText('Auto-scroll: stopped (scraper started).');
-    startScraping();
-};
 uiContainer.appendChild(startButton);
+
+function refreshStartButtonLabelAndBehavior() {
+    // Default baseline: simple "Start Scraping" behaviour.
+    const setDefault = () => {
+        startButton.disabled = false;
+        startButton.textContent = 'Start Scraping';
+        startButton.onclick = () => {
+            stopAutoScrollToText('Auto-scroll: stopped (scraper started).');
+            startScraping();
+        };
+    };
+
+    try {
+        const ctx = typeof computeRunContextFromCurrentPage === 'function'
+            ? computeRunContextFromCurrentPage()
+            : null;
+        const state = typeof loadSearchRunState === 'function'
+            ? loadSearchRunState()
+            : null;
+
+        const hasSearchQueue =
+            !!(state && !state.done && Array.isArray(state.tweetQueue) && state.tweetQueue.length > 0);
+        const isPaused = !!(state && state.paused);
+
+        // Non-search pages or no search run state: keep legacy "Start Scraping".
+        if (!ctx || !(ctx.mode === 'search' || ctx.mode === 'search_advanced' || ctx.mode === 'status') || !hasSearchQueue) {
+            setDefault();
+            return;
+        }
+
+        // On the search page itself: when paused, "Start" becomes "Resume".
+        if (ctx.mode === 'search' || ctx.mode === 'search_advanced') {
+            startButton.disabled = false;
+            if (isPaused) {
+                startButton.textContent = 'Resume search run';
+                startButton.onclick = () => {
+                    stopAutoScrollToText('Auto-scroll: stopped (resuming search run).');
+                    startScraping();
+                };
+            } else {
+                setDefault();
+            }
+            return;
+        }
+
+        // On a status page that is part of the active search run:
+        if (ctx.mode === 'status') {
+            const currentUrl = normalizeStatusUrl(window.location?.href || '');
+            const idx = Number.isFinite(state.currentIndex) ? (state.currentIndex | 0) : 0;
+            const target =
+                state.tweetQueue[idx] ||
+                state.tweetQueue.find(u => normalizeStatusUrl(u) === currentUrl);
+            const isCurrent = !!(target && normalizeStatusUrl(target) === currentUrl);
+
+            if (isCurrent && typeof pauseSearchRunAfterCurrentPage === 'function') {
+                // Repurpose the start button as a pause/resume toggle for search runs.
+                startButton.disabled = false;
+                if (isPaused) {
+                    startButton.textContent = 'Resume after this page';
+                } else {
+                    startButton.textContent = 'Pause after this page';
+                }
+                startButton.onclick = () => {
+                    pauseSearchRunAfterCurrentPage();
+                    // Recompute label based on the new paused state.
+                    try { refreshStartButtonLabelAndBehavior(); } catch { /* ignore */ }
+                };
+                return;
+            }
+
+            // Fallback: behave like a plain start button.
+            setDefault();
+            return;
+        }
+
+        // Fallback for any unexpected mode.
+        setDefault();
+    } catch {
+        setDefault();
+    }
+}
+
+refreshStartButtonLabelAndBehavior();
 
 const stopButton = document.createElement('button');
 stopButton.textContent = 'Stop and Download';
 stopButton.style.cssText = 'padding:8px;background:#e0245e;color:white;border:none;border-radius:4px;cursor:pointer;';
-stopButton.onclick = stopAndDownload;
+stopButton.onclick = () => stopAndDownload({ cancelAll: true });
 uiContainer.appendChild(stopButton);
+
+const cancelSearchRunButton = document.createElement('button');
+cancelSearchRunButton.textContent = 'Cancel search run';
+cancelSearchRunButton.style.cssText = 'padding:8px;background:#b91c1c;color:white;border:none;border-radius:4px;cursor:pointer;';
+cancelSearchRunButton.onclick = () => {
+    try {
+        if (typeof cancelSearchRun === 'function') {
+            cancelSearchRun();
+        } else {
+            setUiStatus('Search run cancel is not available in this build.');
+        }
+    } catch {
+        setUiStatus('Failed to cancel search run.');
+    }
+};
+uiContainer.appendChild(cancelSearchRunButton);
 
 const exportSearchMediaBtn = document.createElement('button');
 exportSearchMediaBtn.textContent = 'Download search media lists';
@@ -375,7 +482,7 @@ waitForBodyReady().then(() => {
         const ctx = computeRunContextFromCurrentPage?.();
         if (ctx && ctx.mode === 'status') {
             const state = loadSearchRunState?.();
-            if (state && !state.done && Array.isArray(state.tweetQueue) && state.tweetQueue.length > 0) {
+            if (state && !state.done && !state.paused && Array.isArray(state.tweetQueue) && state.tweetQueue.length > 0) {
                 const currentUrl = normalizeStatusUrl(window.location?.href || '');
                 const idx = Number.isFinite(state.currentIndex) ? state.currentIndex | 0 : 0;
                 const target = state.tweetQueue[idx] || state.tweetQueue.find(u => normalizeStatusUrl(u) === currentUrl);
@@ -388,6 +495,9 @@ waitForBodyReady().then(() => {
                 }
             }
         }
+
+        // Re-sync the primary control labels now that the page + state are known.
+        try { refreshStartButtonLabelAndBehavior(); } catch { /* ignore */ }
     } catch {
         // ignore auto-start errors
     }

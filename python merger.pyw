@@ -7,7 +7,6 @@ Uses top-level tweet's timestamp for sorting.
 
 import os
 import re
-import sys
 import shutil
 import tempfile
 from datetime import datetime
@@ -21,16 +20,6 @@ class Tweet:
         self.timestamp = timestamp
         self.content = content
         self.source = source
-
-
-def log(msg: str):
-    """Append to log file (for .pyw mode)."""
-    try:
-        log_file = Path(__file__).parent / "merger.log"
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
-    except:
-        pass
 
 
 def extract_tweets_from_content(content: str, source_file: str) -> Iterator[Tweet]:
@@ -106,11 +95,9 @@ def load_merged(path: Path) -> Tuple[List[Tweet], Set[str]]:
                     urls.add(tweet.url)
                     break  # Only need the first tweet from each block
 
-        log(f"Loaded {len(tweets)} tweets from existing merged file")
         return tweets, urls
 
     except Exception as e:
-        log(f"Error loading merged: {e}")
         return [], set()
 
 
@@ -164,7 +151,6 @@ def save_merged(path: Path, tweets: List[Tweet], username: str) -> int:
 
 def main():
     directory = Path.cwd()
-    log(f"Directory: {directory}")
 
     # Find ALL markdown files (not just status_*.md)
     md_files = [f for f in directory.iterdir()
@@ -172,7 +158,6 @@ def main():
 
     if not md_files:
         print("No markdown files found")
-        log("No markdown files")
         return
 
     # Determine username from first file
@@ -183,7 +168,6 @@ def main():
 
     if not username:
         print("Could not extract username from any file")
-        log("Username extraction failed")
         return
 
     merged_path = directory / f"{username}_data_merged.md"
@@ -208,36 +192,19 @@ def main():
                     seen_urls.add(tweet.url)
                     new_count += 1
         except Exception as e:
-            log(f"Error processing {f.name}: {e}")
             print(f"Error processing {f.name}: {e}")
 
     if new_count == 0:
         print(f"No new tweets. Total: {len(all_tweets)}")
-        log(f"No new tweets. Total: {len(all_tweets)}")
         return
 
     print(f"Adding {new_count} new tweet blocks...")
 
-    # Backup existing merged file
-    if merged_path.exists():
-        backup = merged_path.with_suffix(f".md.backup_{datetime.now():%Y%m%d_%H%M%S}")
-        shutil.copy2(merged_path, backup)
-        log(f"Backup: {backup.name}")
-
     total = save_merged(merged_path, all_tweets, username)
     print(f"✅ Updated {merged_path.name} with {total} total tweet blocks")
-    log(f"Updated: {total} total")
-
 
 if __name__ == '__main__':
-    if sys.executable.endswith('pythonw.exe'):
-        log_file = Path(__file__).parent / "merger.log"
-        sys.stdout = open(log_file, 'a', encoding='utf-8')
-        sys.stderr = sys.stdout
-
     try:
         main()
     except Exception as e:
-        log(f"Fatal: {e}")
-        if not sys.executable.endswith('pythonw.exe'):
-            raise
+        raise

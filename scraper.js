@@ -405,7 +405,7 @@
 
     // Smoother scrolling: tick more often, but scroll less per tick (preserve px/sec feel).
     // These are intentionally separate so UI "Scroll step" can remain a simple single value.
-    const SCRAPE_TICK_MS = 750; // was 1500
+    const SCRAPE_TICK_MS = 600; // was 1500
     const SCRAPE_SCROLL_BASE_TICK_MS = 1500;
     const AUTO_SCROLL_TICK_MS = 200; // was 850
     const AUTO_SCROLL_BASE_TICK_MS = 850;
@@ -416,12 +416,38 @@
     const DEFAULT_TRANSLATION_WAIT_MS = 6000;
     const MIN_TRANSLATION_WAIT_MS = 0;
     const MAX_TRANSLATION_WAIT_MS = 15000;
-    const TRANSLATION_POLL_MS = 100;
+    const TRANSLATION_POLL_MS = 50;
     let waitForImmersiveTranslate = DEFAULT_WAIT_FOR_IMMERSIVE_TRANSLATE;
     let translationWaitMs = DEFAULT_TRANSLATION_WAIT_MS;
     // Per-tweet deferral tracking so we don't permanently capture the original before translation arrives.
     // tweetId -> { firstSeenMs: number, defers: number }
     let translationDeferById = new Map();
+
+    /**
+     * Fetch or initialize the per-tweet deferral entry, resetting very stale entries so that
+     * tweets which were scrolled out of view and later re-inserted into the DOM get a fresh
+     * translation window instead of timing out immediately.
+     */
+    function getOrInitTranslationDeferEntry(tweetId, now) {
+        const maxPerTweetWait = Math.max(1200, getTranslationWaitMs());
+        const existing = translationDeferById.get(tweetId);
+        if (!existing) {
+            const fresh = { firstSeenMs: now, defers: 0 };
+            translationDeferById.set(tweetId, fresh);
+            return fresh;
+        }
+
+        // If this tweet was last seen a long time ago, treat it as "new" again. This covers
+        // Twitter/X unloading a translated tweet and later re-adding it, which requires
+        // Immersive Translate to re-inject its DOM.
+        if (now - existing.firstSeenMs > maxPerTweetWait * 3) {
+            const fresh = { firstSeenMs: now, defers: 0 };
+            translationDeferById.set(tweetId, fresh);
+            return fresh;
+        }
+
+        return existing;
+    }
 
     // Optional "start from this tweet" gating
     let startFromTweetId = null; // full status URL (as used by tweet.id)
@@ -434,13 +460,19 @@
     let consecutiveNoNewTicks = 0;
     let lastScrollY = 0;
     let lastScrollHeight = 0;
-    const MAX_NO_NEW_TICKS = 16; // ~12s with 750ms interval
+    const MAX_NO_NEW_TICKS = 12; // ~12s with 750ms interval
     // Extra guard: if Twitter stops loading new timeline elements, stop quickly instead of "busy scrolling".
     const TIMELINE_NO_NEW_ELEMENT_PAUSE_MS = 1100; // ~1s
     const TIMELINE_LOAD_WAIT_MS = 10000; // wait up to 10s for Twitter to append more elements
     let timelineObserver = null;
     let lastTimelineNewElementMs = 0;
     let lastTweetDomCount = 0;
+
+    // When running a multi-page search run, the very first status page load can happen
+    // before Immersive Translate (or similar extensions) have initialized. To avoid
+    // capturing untranslated content, we can enforce a short "initial chill" window
+    // before the first scrape tick on search-run status pages.
+    let searchRunInitialStatusScrapeDelayUntilMs = 0;
 
     // Ensure "Stop and Download" only runs once per scraping run (prevents double downloads
     // when both manual stop and auto-stop try to trigger a download).
@@ -491,6 +523,7 @@
             if (!parsed || typeof parsed !== 'object') return null;
             if (!Array.isArray(parsed.tweetQueue)) parsed.tweetQueue = [];
             parsed.currentIndex = Number.isFinite(parsed.currentIndex) ? parsed.currentIndex | 0 : 0;
+            parsed.paused = !!parsed.paused;
             return parsed;
         } catch {
             return null;
@@ -509,7 +542,8 @@
                 tweetQueue: Array.isArray(state.tweetQueue) ? state.tweetQueue : [],
                 currentIndex: Number.isFinite(state.currentIndex) ? state.currentIndex | 0 : 0,
                 startedAt: state.startedAt || new Date().toISOString(),
-                done: !!state.done
+                done: !!state.done,
+                paused: !!state.paused
             };
             localStorage.setItem(STORAGE_KEYS.searchRunState, JSON.stringify(payload));
         } catch {
@@ -853,6 +887,55 @@
         }
     }
 
+    function clearRememberedScrapedIdsForCurrentPage() {
+        // Identify all tweet IDs present on the current page and remove only those
+        // from the persisted "remembered scraped" set. This lets us re-scrape just
+        // this page without wiping history for other tweets/accounts.
+        const idsOnPage = new Set();
+        try {
+            const links = document.querySelectorAll('article[data-testid="tweet"] a[href*="/status/"]');
+            links.forEach(a => {
+                const href = a?.href || a?.getAttribute?.('href') || '';
+                const id = normalizeStatusUrl(href);
+                if (id) idsOnPage.add(id);
+            });
+        } catch {
+            // DOM access failed; bail out gracefully.
+        }
+
+        if (!idsOnPage.size) {
+            setUiStatus('No tweet IDs found on this page to clear.');
+            return;
+        }
+
+        let removed = 0;
+        idsOnPage.forEach(id => {
+            if (rememberedScrapedIdSet.delete(id)) {
+                removed++;
+            }
+        });
+
+        if (!removed) {
+            setUiStatus('No remembered IDs matched the tweets on this page.');
+            return;
+        }
+
+        // Persist the updated remembered set.
+        saveRememberedScrapedIdsNow();
+
+        // Update the in-memory dedupe set so the current run can re-scrape these tweets.
+        // If "remember scraped IDs" is disabled, scrapedIdSet will be reset on the next run anyway.
+        if (rememberScrapedIdsEnabled) {
+            scrapedIdSet = new Set(rememberedScrapedIdSet);
+        }
+
+        if (highlightScrapedEnabled) {
+            highlightAllScrapedTweets();
+        }
+
+        setUiStatus(`Cleared remembered IDs for ${removed} tweet(s) on this page.`);
+    }
+
     function exportRememberedScrapedIdsToJsonFile(exportKey) {
         const safeKey = String(exportKey || 'account').replace(/[^a-z0-9_-]/gi, '_') || 'account';
         const filename = `${safeKey}_scraped_ids.json`;
@@ -1097,7 +1180,7 @@
         if (getImmersiveTranslateContentNode(tweetTextElement)) return false;
 
         const now = Date.now();
-        const entry = translationDeferById.get(tweetId) || { firstSeenMs: now, defers: 0 };
+        const entry = getOrInitTranslationDeferEntry(tweetId, now);
         entry.defers++;
         translationDeferById.set(tweetId, entry);
 
@@ -1380,14 +1463,33 @@
 
     function normalizeStatusUrl(url) {
         if (!url) return '';
+
+        const raw = String(url);
+
+        // If this looks like any kind of /status/<id> URL (including /photo/1, /video/1, /analytics, etc),
+        // normalize it down to a single canonical form based ONLY on the numeric tweet ID.
+        // This keeps IDs stable between:
+        //  - search timeline cards (/status/<id>/photo/1, /status/<id>/analytics, …)
+        //  - status pages (/user/status/<id>, /i/web/status/<id>, …)
         try {
-            const u = new URL(url, window.location.origin);
+            const restId = extractRestIdFromStatusUrl(raw);
+            if (restId) {
+                const origin = (window.location && window.location.origin) || 'https://x.com';
+                return `${origin}/i/web/status/${restId}`;
+            }
+        } catch {
+            // fall through to generic normalization
+        }
+
+        // Generic URL normalization (for non-status URLs or already-normalized values):
+        try {
+            const u = new URL(raw, window.location.origin);
             // Strip query/hash to make matching stable
             u.search = '';
             u.hash = '';
             return u.toString();
         } catch {
-            return url;
+            return raw;
         }
     }
 
@@ -1711,13 +1813,10 @@
 
         const out = [];
 
-        // Some translation extensions (e.g. Immersive Translate) inject wrapper <font> nodes like:
-        // .immersive-translate-target-wrapper -> (hidden <br>) -> .immersive-translate-target-inner
-        // Prefer scraping the translated "inner" content to avoid duplicated/malformed output.
-        const translatedInner =
-            rootEl.querySelector?.('.immersive-translate-target-inner') ||
-            rootEl.querySelector?.('.immersive-translate-target-translation-block-wrapper') ||
-            rootEl.querySelector?.('[data-immersive-translate-translation-element-mark]');
+        // Some translation extensions (e.g. Immersive Translate) inject translated content
+        // as a sibling or wrapper around the original tweet text. Prefer scraping the
+        // translated node (if present) instead of the original.
+        const translatedInner = getImmersiveTranslateContentNode(rootEl);
         const effectiveRoot = translatedInner || rootEl;
 
         const walk = (node) => {
@@ -1762,18 +1861,64 @@
 
     function getImmersiveTranslateContentNode(rootEl) {
         if (!rootEl) return null;
-        return (
-            rootEl.querySelector?.('.immersive-translate-target-inner') ||
-            rootEl.querySelector?.('.immersive-translate-target-translation-block-wrapper') ||
-            rootEl.querySelector?.('[data-immersive-translate-translation-element-mark]') ||
-            null
+
+        // Core Immersive Translate content markers. These cover both block and inline
+        // translation containers as used in the upstream extension.
+        const TRANSLATION_SELECTOR = [
+            '.immersive-translate-target-inner',
+            '.immersive-translate-target-translation-block-wrapper',
+            '.immersive-translate-target-translation-inline-wrapper',
+            '.immersive-translate-target-translation-vertical-block-wrapper',
+            '.immersive-translate-target-translation-pre-whitespace',
+            '.immersive-translate-target-translation-pdf-block-wrapper',
+            '[data-immersive-translate-translation-element-mark]'
+        ].join(', ');
+
+        // 1) Direct hits on the node itself or its descendants.
+        if (rootEl.matches?.(TRANSLATION_SELECTOR)) return rootEl;
+        const direct = rootEl.querySelector?.(TRANSLATION_SELECTOR);
+        if (direct) return direct;
+
+        // 2) Immersive sometimes injects translated DOM as a sibling or wrapper around
+        // the original text node. Look at nearby siblings under the same parent.
+        const parent = rootEl.parentElement;
+        if (parent) {
+            for (let node = parent.firstElementChild; node; node = node.nextElementSibling) {
+                if (node === rootEl) continue;
+                if (node.matches?.(TRANSLATION_SELECTOR)) return node;
+                const nested = node.querySelector?.(TRANSLATION_SELECTOR);
+                if (nested) return nested;
+            }
+        }
+
+        // 3) Walk up to a nearby Immersive wrapper that might contain both original
+        // and translated content, then search within it.
+        const wrapper = rootEl.closest?.(
+            '.immersive-translate-target-wrapper, [data-immersive-translate-paragraph]'
         );
+        if (wrapper) {
+            if (wrapper.matches?.(TRANSLATION_SELECTOR)) return wrapper;
+            const nested = wrapper.querySelector?.(TRANSLATION_SELECTOR);
+            if (nested) return nested;
+        }
+
+        return null;
     }
 
     function isImmersiveTranslateActiveOnPage() {
         // Best-effort: if the extension isn't installed/active, don't add unnecessary waits.
         return !!document.querySelector(
-            '.immersive-translate-target-wrapper, .immersive-translate-target-inner, [data-immersive-translate-translation-element-mark]'
+            [
+                '.immersive-translate-target-wrapper',
+                '.immersive-translate-target-inner',
+                '.immersive-translate-target-translation-block-wrapper',
+                '.immersive-translate-target-translation-inline-wrapper',
+                '.immersive-translate-target-translation-vertical-block-wrapper',
+                '.immersive-translate-target-translation-pre-whitespace',
+                '.immersive-translate-target-translation-pdf-block-wrapper',
+                '[data-immersive-translate-translation-element-mark]',
+                '[data-immersive-translate-paragraph]'
+            ].join(', ')
         );
     }
 
@@ -1841,12 +1986,25 @@
 
         const out = [];
         const tweetEls = document.querySelectorAll('article[data-testid="tweet"]');
+        const now = Date.now();
+        const maxPerTweetWait = Math.max(1200, getTranslationWaitMs());
+
         for (let i = 0; i < tweetEls.length && out.length < limit; i++) {
             const tweet = tweetEls[i];
             const tweetLinkElement = tweet.querySelector('a[href*="/status/"]');
             const tweetId = normalizeStatusUrl(tweetLinkElement?.href);
             if (!tweetId || scrapedIdSet.has(tweetId)) continue;
-            if (!translationDeferById.has(tweetId)) continue;
+
+            const entry = translationDeferById.get(tweetId);
+            if (!entry) continue;
+
+            // Drop very stale entries so tweets that were unloaded and then re-added
+            // can receive a fresh translation deferral window.
+            if (now - entry.firstSeenMs > maxPerTweetWait * 3) {
+                translationDeferById.delete(tweetId);
+                continue;
+            }
+
             const tweetTextElement = tweet.querySelector('[data-testid="tweetText"]');
             if (!tweetTextElement) continue;
             if (getImmersiveTranslateContentNode(tweetTextElement)) continue;
@@ -1899,7 +2057,8 @@
             tweetQueue: filteredQueue,
             currentIndex: 0,
             startedAt: new Date().toISOString(),
-            done: false
+            done: false,
+            paused: false
         };
         saveSearchRunState(state);
 
@@ -1918,6 +2077,31 @@
 
         // Special handling: search results / advanced search acts as controller that walks each status page.
         if (currentRunMode === 'search' || currentRunMode === 'search_advanced') {
+            // If there is an existing paused search run with a queue, resume instead of starting over.
+            const existing = loadSearchRunState();
+            const hasQueue =
+                existing &&
+                !existing.done &&
+                Array.isArray(existing.tweetQueue) &&
+                existing.tweetQueue.length > 0;
+            if (hasQueue && existing.paused) {
+                const idx = Number.isFinite(existing.currentIndex) ? (existing.currentIndex | 0) : 0;
+                const safeIdx = Math.max(0, Math.min(idx, existing.tweetQueue.length - 1));
+                const target = existing.tweetQueue[safeIdx];
+
+                existing.paused = false;
+                existing.currentIndex = safeIdx;
+                saveSearchRunState(existing);
+
+                if (target) {
+                    setUiStatus(`Resuming search run at ${safeIdx + 1}/${existing.tweetQueue.length}…`);
+                    window.location.href = target;
+                } else {
+                    setUiStatus('Cannot resume search run: no remaining tweets in queue.');
+                }
+                return;
+            }
+
             // Avoid starting the legacy timeline-based scraper on search pages.
             startSearchRunFromSearchPage(ctx);
             return;
@@ -1952,12 +2136,50 @@
         lastScrollY = window.scrollY;
         lastScrollHeight = document.documentElement.scrollHeight;
 
+        // If this status page is being visited as part of an active search run,
+        // give translation extensions a brief window (1s) to initialize before
+        // we start scrolling and scraping. This helps the very first tweet on
+        // the page get translated before we capture its text.
+        searchRunInitialStatusScrapeDelayUntilMs = 0;
+        if (currentRunMode === 'status') {
+            try {
+                const state = loadSearchRunState();
+                const hasQueue =
+                    state &&
+                    !state.done &&
+                    state.mode === 'search' &&
+                    Array.isArray(state.tweetQueue) &&
+                    state.tweetQueue.length > 0;
+                if (hasQueue) {
+                    const currentUrl = getNormalizedCurrentStatusUrl();
+                    const idx = Number.isFinite(state.currentIndex) ? (state.currentIndex | 0) : 0;
+                    const target =
+                        state.tweetQueue[idx] ||
+                        state.tweetQueue.find(u => normalizeStatusUrl(u) === currentUrl);
+                    const isCurrent = !!(target && normalizeStatusUrl(target) === currentUrl);
+                    if (isCurrent) {
+                        searchRunInitialStatusScrapeDelayUntilMs = Date.now() + 2000;
+                    }
+                }
+            } catch {
+                // ignore search state errors; fall back to no extra delay
+            }
+        }
+
         let tickInProgress = false;
         scrollInterval = setInterval(() => {
+            // Optional initial delay for search-run status pages (see above).
+            if (searchRunInitialStatusScrapeDelayUntilMs && Date.now() < searchRunInitialStatusScrapeDelayUntilMs) {
+                return;
+            }
             if (tickInProgress) return;
             tickInProgress = true;
 
             (async () => {
+                // Before we scroll further down, give any previously deferred tweets a chance
+                // to receive their translated DOM so we don't race ahead of the extension.
+                await waitForDeferredTranslationsToSettle();
+
                 const beforeCount = scrapedData.length;
                 const beforeY = window.scrollY;
                 const beforeH = document.documentElement.scrollHeight;
@@ -2210,7 +2432,8 @@
         saveSearchAggregate(agg);
     }
 
-    function advanceSearchRunAfterDownload() {
+    function advanceSearchRunAfterDownload(options) {
+        const skipNavigate = !!(options && options.skipNavigate);
         const state = loadSearchRunState();
         if (!state || !Array.isArray(state.tweetQueue) || state.done) return;
 
@@ -2230,13 +2453,16 @@
         if (idx >= state.tweetQueue.length) {
             state.done = true;
             state.currentIndex = state.tweetQueue.length;
+            state.paused = false;
             saveSearchRunState(state);
             // When finished, navigate back to the original search page if we have it.
-            if (state.searchUrl) {
-                setUiStatus('Search run completed. Returning to search page…');
-                window.location.href = state.searchUrl;
-            } else {
-                setUiStatus('Search run completed.');
+            if (!skipNavigate) {
+                if (state.searchUrl) {
+                    setUiStatus('Search run completed. Returning to search page…');
+                    window.location.href = state.searchUrl;
+                } else {
+                    setUiStatus('Search run completed.');
+                }
             }
             return;
         }
@@ -2245,13 +2471,55 @@
         saveSearchRunState(state);
 
         const next = state.tweetQueue[idx];
-        if (next) {
+        if (next && !skipNavigate) {
             setUiStatus(`Search run: opening ${idx + 1}/${state.tweetQueue.length}…`);
             window.location.href = next;
         }
     }
 
-    function stopAndDownload() {
+    function cancelSearchRun() {
+        const state = loadSearchRunState();
+        if (!state || !Array.isArray(state.tweetQueue) || state.tweetQueue.length === 0 || state.done) {
+            setUiStatus('No active search run to cancel.');
+            return;
+        }
+
+        state.done = true;
+        state.paused = false;
+        saveSearchRunState(state);
+
+        if (state.searchUrl) {
+            setUiStatus('Search run cancelled. Returning to search page…');
+            try {
+                window.location.href = state.searchUrl;
+            } catch {
+                // ignore navigation failures
+            }
+        } else {
+            setUiStatus('Search run cancelled.');
+        }
+    }
+
+    function pauseSearchRunAfterCurrentPage() {
+        const state = loadSearchRunState();
+        if (!state || !Array.isArray(state.tweetQueue) || state.tweetQueue.length === 0 || state.done) {
+            setUiStatus('No active search run to pause.');
+            return;
+        }
+        if (state.paused) {
+            // Treat a second click as a "resume after this page" toggle.
+            state.paused = false;
+            saveSearchRunState(state);
+            setUiStatus('Search run unpaused; it will continue after this status page is downloaded.');
+            return;
+        }
+        state.paused = true;
+        saveSearchRunState(state);
+        setUiStatus('Search run will pause after this status page is downloaded.');
+    }
+
+    function stopAndDownload(options) {
+        const cancelAll = !!(options && options.cancelAll);
         // If a download has already been triggered for this run (whether via auto-stop
         // or a previous manual click), do nothing. This prevents the "double download"
         // case where auto-stop fires shortly after a manual Stop+Download click.
@@ -2358,8 +2626,26 @@
             setUiStatus(`Downloaded. ${formatStartTweetStatus()}`);
 
             if (isPartOfSearchRun) {
-                // If this status page is part of an active search run, continue to the next tweet.
-                advanceSearchRunAfterDownload();
+                const isPaused = !!searchState.paused;
+                if (cancelAll) {
+                    // User clicked explicit Stop+Download: cancel the rest of the search run.
+                    searchState.done = true;
+                    searchState.paused = false;
+                    saveSearchRunState(searchState);
+                    if (searchState.searchUrl) {
+                        setUiStatus('Search run stopped. Returning to search page…');
+                        window.location.href = searchState.searchUrl;
+                    } else {
+                        setUiStatus(`Search run stopped. ${formatStartTweetStatus()}`);
+                    }
+                } else if (isPaused) {
+                    // Pause after finishing this status page: update index but do not auto-open next page.
+                    advanceSearchRunAfterDownload({ skipNavigate: true });
+                    setUiStatus(`Search run paused. ${formatStartTweetStatus()}`);
+                } else {
+                    // Normal behaviour: continue automatically to the next status page.
+                    advanceSearchRunAfterDownload();
+                }
             }
             return;
         }
