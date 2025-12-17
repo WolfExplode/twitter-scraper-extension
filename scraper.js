@@ -45,6 +45,17 @@
     // Map tweet rest_id -> boolean (detected voice media)
     const voiceDetectedByRestId = new Map();
 
+    /**
+     * Clear per-run media caches that are populated by network interceptors and tweet extraction.
+     * This keeps memory usage bounded across long SPA sessions without affecting existing exports,
+     * since exported data is copied out of these structures into `scrapedData` as we go.
+     */
+    function clearPerRunMediaCaches() {
+        videoFilesByRestId.clear();
+        voiceTweetUrlsByRestId.clear();
+        voiceDetectedByRestId.clear();
+    }
+
     function extractRestIdFromStatusUrl(statusUrl) {
         // Works for:
         // - https://x.com/user/status/123...
@@ -1358,6 +1369,24 @@
         return clampNumber(translationWaitMs, MIN_TRANSLATION_WAIT_MS, MAX_TRANSLATION_WAIT_MS) | 0;
     }
 
+    /**
+     * Drop very stale entries from `translationDeferById` so that long-lived tabs
+     * (SPA navigations, many search runs) don't accumulate defer metadata forever.
+     */
+    function cleanupStaleTranslationDeferrals(maxAgeMs) {
+        const now = Date.now();
+        const age = Math.max(0, maxAgeMs | 0) || (getTranslationWaitMs() * 3) || 30000;
+        for (const [id, entry] of translationDeferById.entries()) {
+            if (!entry || typeof entry.firstSeenMs !== 'number') {
+                translationDeferById.delete(id);
+                continue;
+            }
+            if (now - entry.firstSeenMs > age) {
+                translationDeferById.delete(id);
+            }
+        }
+    }
+
     function shouldDeferTweetUntilTranslated(tweetId, tweetTextElement) {
         if (!waitForImmersiveTranslate) return false;
         if (!tweetId || !tweetTextElement) return false;
@@ -2208,6 +2237,8 @@
         if (waitMs <= 0) return;
 
         const maxWait = Math.max(1200, waitMs);
+        // Periodically trim very old deferrals so long-running sessions don't accumulate them.
+        cleanupStaleTranslationDeferrals(maxWait * 3);
         const start = Date.now();
         while (Date.now() - start < maxWait) {
             const pending = getDeferredUnscrapedTweetTextElements(12);
@@ -2321,8 +2352,8 @@
         } else {
             console.log(`Scraping started (page mode: ${currentRunMode})...`);
         }
-        // Reset per-run voice URL collection
-        voiceTweetUrlsByRestId.clear();
+        // Reset per-run media/voice caches populated by network interceptors.
+        clearPerRunMediaCaches();
         // Gate extraction until we hit the selected start tweet, if any.
         // NOTE: On /status pages, "start tweet" gating is not useful and can cause the root tweet to be skipped.
         hasReachedStartTweet = (currentRunMode === 'status') ? true : !startFromTweetId;
@@ -2843,6 +2874,12 @@
                     advanceSearchRunAfterDownload();
                 }
             }
+
+            // After exporting, drop large per-run collections to keep memory usage flat.
+            // (Dedupe sets remain so checkpoints and highlighting still work.)
+            scrapedData = [];
+            translationDeferById.clear();
+            clearPerRunMediaCaches();
             return;
         }
 
@@ -2945,6 +2982,11 @@
 
         // Update status after download to show the saved checkpoint.
         setUiStatus(`Downloaded. ${formatStartTweetStatus()}`);
+
+        // After exporting, release large per-run collections while keeping dedupe state.
+        scrapedData = [];
+        translationDeferById.clear();
+        clearPerRunMediaCaches();
     }
 
     /**
