@@ -545,9 +545,9 @@
     const MIN_EFFECTIVE_SCROLL_STEP_PX = 80; // allows smaller increments even if UI min is higher
 
     // Search-run safety limit: cap how many /status posts (root tweets) a multi-page search run will visit.
-    const DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS = 500;
+    const DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS = 50;
     const MIN_SEARCH_RUN_MAX_STATUS_POSTS = 15;
-    const MAX_SEARCH_RUN_MAX_STATUS_POSTS = 5000;
+    const MAX_SEARCH_RUN_MAX_STATUS_POSTS = 20;
     let searchRunMaxStatusPosts = DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS;
 
     // Optional: wait for translation plugins (e.g. Immersive Translate) to inject translated DOM.
@@ -2002,6 +2002,68 @@
     }
 
     /**
+     * Extract poll metadata (options, percentages, summary) from a tweet element.
+     *
+     * Handles the "cardPoll" layout as seen in current X DOM:
+     *   <div data-testid="cardPoll">
+     *     <ul role="list">
+     *       <li role="listitem"> ... option label + percent ... </li>
+     *       ...
+     *     </ul>
+     *     <div>80 votes · Final results</div>
+     *   </div>
+     */
+    function extractPollFromTweetElement(tweetEl) {
+        if (!tweetEl) return null;
+
+        const pollRoot = tweetEl.querySelector('[data-testid="cardPoll"]');
+        if (!pollRoot) return null;
+
+        const options = [];
+
+        const items = pollRoot.querySelectorAll('li[role="listitem"]');
+        items.forEach(li => {
+            if (!li) return;
+
+            // Best-effort: option label is usually the first dir="ltr" text block inside the item.
+            let label = '';
+            const labelBlock = li.querySelector('div[dir="ltr"]');
+            if (labelBlock) {
+                label = (labelBlock.innerText || labelBlock.textContent || '').trim();
+            } else {
+                label = (li.innerText || li.textContent || '').trim();
+            }
+
+            // Percent text is often in a trailing container with a number + "%" (e.g. "32.5%").
+            let percent = '';
+            const percentBlock = li.querySelector('div[dir="ltr"] span');
+            if (percentBlock) {
+                const raw = (percentBlock.innerText || percentBlock.textContent || '').trim();
+                const m = raw.match(/[\d.,]+\s*%/);
+                if (m) percent = m[0].replace(/\s+/g, '');
+            }
+
+            if (label) {
+                options.push({
+                    label,
+                    percent
+                });
+            }
+        });
+
+        if (options.length === 0) return null;
+
+        // Poll summary line (e.g. "80 votes · Final results").
+        let summary = '';
+        const summaryBlock = pollRoot.querySelector('div[dir="ltr"]');
+        if (summaryBlock) {
+            summary = (summaryBlock.innerText || summaryBlock.textContent || '').trim();
+        }
+
+        return { options, summary };
+    }
+
+    /**
      * Locate embedded "quote tweet" cards inside a tweet article.
      *
      * In X's current DOM, quote tweets render as a small card with a "Quote" label and a
@@ -2738,6 +2800,8 @@
                 replies: [], // For compatibility; will be rebuilt during processing
                 // Optional embedded quote tweet, if present.
                 quote: null,
+                // Optional embedded poll (cardPoll), if present.
+                poll: null,
                 // Whether Immersive Translate (or a compatible extension) has injected translated DOM
                 // for this tweet at the time of scraping.
                 isTranslated: hasTranslatedNode
@@ -2755,6 +2819,16 @@
             } catch {
                 // Quote extraction is best-effort; never let failures break the main scrape.
                 tweetData.quote = null;
+            }
+
+            // If this tweet contains an embedded poll, capture its options/summary for markdown export.
+            try {
+                const poll = extractPollFromTweetElement(tweet);
+                if (poll) {
+                    tweetData.poll = poll;
+                }
+            } catch {
+                tweetData.poll = null;
             }
 
             // If this tweet was detected as a voice post, store its URL for yt-dlp export.
@@ -3486,6 +3560,37 @@
 
             if (renderedLines.length > 0) {
                 content += "\n" + renderedLines.join("\n");
+            }
+        }
+
+        // If this tweet contains an embedded poll, render it as a compact markdown block.
+        if (tweet.poll && Array.isArray(tweet.poll.options) && tweet.poll.options.length > 0) {
+            const pollIndent = indent;
+            const lines = [];
+
+            const summaryText = String(tweet.poll.summary || '').trim();
+            if (summaryText) {
+                const safeSummary = escapeMarkdownInlineTextPreservingUrls(summaryText);
+                lines.push(`${pollIndent}Poll: ${safeSummary}`);
+            } else {
+                lines.push(`${pollIndent}Poll:`);
+            }
+
+            tweet.poll.options.forEach(opt => {
+                if (!opt) return;
+                const rawLabel = String(opt.label || '').trim();
+                if (!rawLabel) return;
+                const safeLabel = escapeMarkdownInlineTextPreservingUrls(rawLabel);
+                const pct = String(opt.percent || '').trim();
+                if (pct) {
+                    lines.push(`${pollIndent}- ${safeLabel} — ${pct}`);
+                } else {
+                    lines.push(`${pollIndent}- ${safeLabel}`);
+                }
+            });
+
+            if (lines.length > 0) {
+                content += "\n" + lines.join("\n");
             }
         }
 
