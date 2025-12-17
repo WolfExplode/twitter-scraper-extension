@@ -546,13 +546,15 @@
 
     // Search-run safety limit: cap how many /status posts (root tweets) a multi-page search run will visit.
     const DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS = 500;
-    const MIN_SEARCH_RUN_MAX_STATUS_POSTS = 30;
+    const MIN_SEARCH_RUN_MAX_STATUS_POSTS = 15;
     const MAX_SEARCH_RUN_MAX_STATUS_POSTS = 5000;
     let searchRunMaxStatusPosts = DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS;
 
     // Optional: wait for translation plugins (e.g. Immersive Translate) to inject translated DOM.
     const DEFAULT_WAIT_FOR_IMMERSIVE_TRANSLATE = false;
-    const DEFAULT_TRANSLATION_WAIT_MS = 6000;
+    // Use a long default window so translation extensions have ample time to inject DOM
+    // before we fall back to original text.
+    const DEFAULT_TRANSLATION_WAIT_MS = 15000;
     const MIN_TRANSLATION_WAIT_MS = 0;
     const MAX_TRANSLATION_WAIT_MS = 15000;
     const TRANSLATION_POLL_MS = 50;
@@ -1959,12 +1961,25 @@
 
     function extractTweetPhotoFilenames(tweetEl) {
         // Collect filenames that match how your downloader saves them (e.g. G74vDW1bEAAT6aD.jpg).
+        // For top-level tweets that contain a quoted-tweet card, we *exclude* media that lives
+        // inside the quote card; that media is attached to the quoted tweet instead.
         if (!tweetEl) return [];
 
         const out = new Set();
 
+        // Pre-compute any embedded quote card containers so we can skip media inside them.
+        const quoteCardEls = findQuoteCardElements?.(tweetEl) || [];
+        const isInsideQuoteCard = (node) => {
+            if (!node || quoteCardEls.length === 0) return false;
+            for (const card of quoteCardEls) {
+                if (card && card.contains(node)) return true;
+            }
+            return false;
+        };
+
         // 1) Direct <img> tags (common).
         tweetEl.querySelectorAll('img[src*="pbs.twimg.com/media/"]').forEach(img => {
+            if (isInsideQuoteCard(img)) return;
             const src = img.getAttribute('src') || '';
             const filename = normalizeTwitterMediaFilenameFromUrl(src);
             if (filename) out.add(filename);
@@ -1972,6 +1987,7 @@
 
         // 2) Background-image styles (some layouts use this for photos).
         tweetEl.querySelectorAll('[style*="pbs.twimg.com/media/"]').forEach(el => {
+            if (isInsideQuoteCard(el)) return;
             const style = el.getAttribute('style') || '';
             const matches = style.match(/url\(["']?(https?:\/\/pbs\.twimg\.com\/media\/[^"')]+)["']?\)/gi) || [];
             matches.forEach(m => {
@@ -1983,6 +1999,122 @@
         });
 
         return Array.from(out);
+    }
+
+    /**
+     * Locate embedded "quote tweet" cards inside a tweet article.
+     *
+     * In X's current DOM, quote tweets render as a small card with a "Quote" label and a
+     * clickable container (role="link") that holds avatar, handle, tweet text and media.
+     *
+     * Example (abridged):
+     *   <div aria-labelledby="id__3p48iv... id__4im8v0..." id="id__0m3oh2...">
+     *     <div id="id__3p48iv...">
+     *       <div dir="ltr">Quote</div>
+     *       <div tabindex="0" role="link"> ... quoted tweet content ... </div>
+     *     </div>
+     *   </div>
+     *
+     * We return the innermost card container(s) (the role="link" elements).
+     */
+    function findQuoteCardElements(tweetEl) {
+        if (!tweetEl) return [];
+
+        const cards = [];
+
+        // Scan small-ish candidate set: containers that group "Quote" label + card.
+        const containers = tweetEl.querySelectorAll('div[aria-labelledby]');
+        containers.forEach(container => {
+            if (!container) return;
+
+            // Look for a nearby label whose text is exactly "Quote" (English locale).
+            const labelEl =
+                container.querySelector('div[dir="ltr"]') ||
+                container.querySelector('span[dir="ltr"]') ||
+                container.querySelector('div') ||
+                container.querySelector('span');
+
+            const labelText = (labelEl?.innerText || labelEl?.textContent || '').trim();
+            if (!/^quote$/i.test(labelText)) return;
+
+            const cardEl = container.querySelector('div[role="link"]');
+            if (cardEl) cards.push(cardEl);
+        });
+
+        return cards;
+    }
+
+    /**
+     * Extract a minimal tweet-like object for a quoted tweet embedded inside a tweet article.
+     * Returns null when no quote is present.
+     */
+    function extractQuoteTweetFromTweetElement(tweetEl) {
+        if (!tweetEl) return null;
+
+        const cards = findQuoteCardElements(tweetEl);
+        if (!cards || cards.length === 0) return null;
+
+        // X only displays a single quoted tweet per post today; we take the first card.
+        const card = cards[0];
+
+        const tweetLinkElement = card.querySelector('a[href*="/status/"]');
+        const tweetId = normalizeStatusUrl(tweetLinkElement?.href || '');
+
+        const tweetTextElement = card.querySelector('[data-testid="tweetText"]');
+        const timeElement = card.querySelector('time');
+
+        // Extract display name + handle from the compact quote card layout.
+        let authorName = '';
+        let authorHandle = '';
+        const userNameContainer = card.querySelector('div[data-testid="User-Name"]');
+        if (userNameContainer) {
+            const spans = Array.from(userNameContainer.querySelectorAll('span'));
+            // Handle: span whose text looks like "@username".
+            const handleSpan = spans.find(el => /^@[A-Za-z0-9_]{1,15}$/.test((el.innerText || el.textContent || '').trim()));
+            if (handleSpan) {
+                authorHandle = (handleSpan.innerText || handleSpan.textContent || '').trim();
+            }
+            // Name: first non-empty span that is not the handle and does not start with "@".
+            const nameSpan = spans.find(el => {
+                const t = (el.innerText || el.textContent || '').trim();
+                if (!t) return false;
+                if (t === authorHandle) return false;
+                if (t.startsWith('@')) return false;
+                return true;
+            });
+            if (nameSpan) {
+                authorName = (nameSpan.innerText || nameSpan.textContent || '').trim();
+            }
+        }
+
+        const quoteData = {
+            id: tweetId,
+            authorName,
+            authorHandle,
+            authorAvatarUrl: normalizeAvatarUrlTo200x200(extractAvatarUrl(card) || ''),
+            authorAvatarFile: '',
+            photoFiles: extractTweetPhotoFilenames(card),
+            videoFiles: (() => {
+                const restId = extractRestIdFromStatusUrl(tweetId);
+                if (!restId) return [];
+                const set = videoFilesByRestId.get(restId);
+                return set ? Array.from(set) : [];
+            })(),
+            isVoicePost: (() => {
+                const restId = extractRestIdFromStatusUrl(tweetId);
+                return !!(restId && voiceDetectedByRestId.get(restId));
+            })(),
+            text: extractTweetTextWithEmojis(tweetTextElement) || '',
+            timestamp: timeElement?.getAttribute('datetime') || ''
+        };
+
+        // Determine a stable local avatar filename for markdown linking + export list.
+        quoteData.authorAvatarFile = avatarFilenameFromUrlAndHandle(
+            quoteData.authorAvatarUrl,
+            quoteData.authorHandle
+        );
+
+        return quoteData;
     }
 
     function emojiUnicodeFromTwitterUrl(src) {
@@ -2578,6 +2710,9 @@
                 hasReplies = replyMatch && parseInt(replyMatch[1]) > 0;
             }
 
+            // Detect whether this tweet currently has translated content injected.
+            const hasTranslatedNode = !!(tweetTextElement && getImmersiveTranslateContentNode(tweetTextElement));
+
             const tweetData = {
                 id: tweetId,
                 authorName: tweet.querySelector('div[data-testid="User-Name"] a:not([tabindex="-1"]) span span')?.innerText || '',
@@ -2600,11 +2735,27 @@
                 timestamp: timeElement?.getAttribute('datetime') || '',
                 isReply: isReply,
                 hasReplies: hasReplies,
-                replies: [] // For compatibility; will be rebuilt during processing
+                replies: [], // For compatibility; will be rebuilt during processing
+                // Optional embedded quote tweet, if present.
+                quote: null,
+                // Whether Immersive Translate (or a compatible extension) has injected translated DOM
+                // for this tweet at the time of scraping.
+                isTranslated: hasTranslatedNode
             };
 
             // Determine a stable local avatar filename for markdown linking + export list.
             tweetData.authorAvatarFile = avatarFilenameFromUrlAndHandle(tweetData.authorAvatarUrl, tweetData.authorHandle);
+
+            // If this tweet embeds a quoted tweet card, capture that as a nested, tweet-like object.
+            try {
+                const quoteTweet = extractQuoteTweetFromTweetElement(tweet);
+                if (quoteTweet) {
+                    tweetData.quote = quoteTweet;
+                }
+            } catch {
+                // Quote extraction is best-effort; never let failures break the main scrape.
+                tweetData.quote = null;
+            }
 
             // If this tweet was detected as a voice post, store its URL for yt-dlp export.
             if (tweetData.isVoicePost) {
@@ -2624,7 +2775,18 @@
 
             scrapedData.push(tweetData);
             scrapedIdSet.add(tweetId);
-            rememberScrapedTweetId(tweetId);
+            // Only persist into the cross-run "remembered" set if either:
+            //  - we're not waiting for Immersive Translate, or
+            //  - the translation extension isn't active, or
+            //  - this tweet actually has translated DOM injected.
+            // This lets untranslated fallbacks (e.g. kaomoji-only posts) be re-scraped on future runs.
+            const shouldRememberForFutureRuns =
+                !waitForImmersiveTranslate ||
+                !isImmersiveTranslateActiveOnPage() ||
+                !!tweetData.isTranslated;
+            if (shouldRememberForFutureRuns) {
+                rememberScrapedTweetId(tweetId);
+            }
         });
 
         console.log(`Extracted ${scrapedData.length} tweets so far...`);
@@ -2696,6 +2858,12 @@
 
         state.currentIndex = idx;
         saveSearchRunState(state);
+
+        // Flush pending remembered-ID saves before navigating so search pages can
+        // immediately highlight already-scraped tweets.
+        if (rememberScrapedIdsEnabled) {
+            saveRememberedScrapedIdsNow();
+        }
 
         const next = state.tweetQueue[idx];
         if (next && !skipNavigate) {
@@ -2780,7 +2948,95 @@
 
         // --- Mode A: Tweet permalink/status page ---
         if (runMode === 'status' && rootRestId) {
-            // Find the root tweet we are viewing by rest_id.
+            // In some edge cases (e.g. heavy translation/extension interference), the periodic
+            // extractor may have failed to capture any tweets before Stop+Download is triggered.
+            // As a safety net, fall back to a one-off DOM scrape of the visible status tweet.
+            if (scrapedData.length === 0) {
+                try {
+                    const article = document.querySelector('article[data-testid="tweet"]');
+                    if (article) {
+                        // Prefer the URL-derived ID for this status page; only fall back to an
+                        // in-article /status/ link if it matches the same rest_id.
+                        const locUrl = getNormalizedCurrentStatusUrl();
+                        const locRestId = extractRestIdFromStatusUrl(locUrl);
+
+                        const linkEl = article.querySelector('a[href*="/status/"]');
+                        const hrefUrl = normalizeStatusUrl(linkEl?.href || '');
+                        const hrefRestId = extractRestIdFromStatusUrl(hrefUrl);
+
+                        let tweetId = locUrl || hrefUrl || '';
+                        if (hrefRestId && locRestId && hrefRestId === locRestId) {
+                            tweetId = hrefUrl || locUrl;
+                        }
+
+                        const tweetTextElement = article.querySelector('[data-testid="tweetText"]');
+                        const timeElement = article.querySelector('time');
+
+                        const statsGroup = article.querySelector('div[role="group"][aria-label]');
+                        let hasReplies = false;
+                        if (statsGroup) {
+                            const ariaLabel = (statsGroup.getAttribute('aria-label') || '').toLowerCase();
+                            const replyMatch = ariaLabel.match(/(\d+)\s+repl/i);
+                            hasReplies = !!(replyMatch && parseInt(replyMatch[1], 10) > 0);
+                        }
+
+                        const hasTranslatedNode =
+                            !!(tweetTextElement && getImmersiveTranslateContentNode(tweetTextElement));
+
+                        const tweetData = {
+                            id: tweetId,
+                            authorName:
+                                article.querySelector(
+                                    'div[data-testid="User-Name"] a:not([tabindex="-1"]) span span'
+                                )?.innerText || '',
+                            authorHandle:
+                                article.querySelector(
+                                    'div[data-testid="User-Name"] a[tabindex="-1"] span'
+                                )?.innerText || '',
+                            authorAvatarUrl: normalizeAvatarUrlTo200x200(extractAvatarUrl(article) || ''),
+                            authorAvatarFile: '',
+                            photoFiles: extractTweetPhotoFilenames(article),
+                            videoFiles: (() => {
+                                const restId = extractRestIdFromStatusUrl(tweetId);
+                                if (!restId) return [];
+                                const set = videoFilesByRestId.get(restId);
+                                return set ? Array.from(set) : [];
+                            })(),
+                            isVoicePost: (() => {
+                                const restId = extractRestIdFromStatusUrl(tweetId);
+                                return !!(restId && voiceDetectedByRestId.get(restId));
+                            })(),
+                            text: extractTweetTextWithEmojis(tweetTextElement) || '',
+                            timestamp: timeElement?.getAttribute('datetime') || '',
+                            isReply: false,
+                            hasReplies,
+                            replies: [],
+                            quote: extractQuoteTweetFromTweetElement(article) || null,
+                            isTranslated: hasTranslatedNode
+                        };
+
+                        tweetData.authorAvatarFile = avatarFilenameFromUrlAndHandle(
+                            tweetData.authorAvatarUrl,
+                            tweetData.authorHandle
+                        );
+
+                        scrapedData.push(tweetData);
+                        scrapedIdSet.add(tweetId);
+
+                        const shouldRememberForFutureRuns =
+                            !waitForImmersiveTranslate ||
+                            !isImmersiveTranslateActiveOnPage() ||
+                            !!tweetData.isTranslated;
+                        if (tweetId && shouldRememberForFutureRuns) {
+                            rememberScrapedTweetId(tweetId);
+                        }
+                    }
+                } catch {
+                    // Fallback scrape is best-effort; continue even if it fails.
+                }
+            }
+
+            // Find the root tweet we are viewing by rest_id (or fall back to the first scraped tweet).
             const rootIdx = scrapedData.findIndex(t => extractRestIdFromStatusUrl(t?.id) === rootRestId);
             const rootTweet = rootIdx >= 0 ? scrapedData[rootIdx] : (scrapedData[0] || null);
 
@@ -3212,7 +3468,7 @@
         const safeHandle = escapeMarkdownInlineText(tweet.authorHandle);
         let content = `${indent}${avatarMd}**${safeHandle}** ${dateLink}`;
 
-        const textLines = stripYouTubeUrlsFromLines(tweet.text.split("\n"));
+        const textLines = stripYouTubeUrlsFromLines(String(tweet.text || '').split("\n"));
         if (textLines.length > 0 && textLines[0].trim()) {
             const textIndent = indent;
             const renderedLines = textLines
@@ -3230,6 +3486,72 @@
 
             if (renderedLines.length > 0) {
                 content += "\n" + renderedLines.join("\n");
+            }
+        }
+
+        // If this tweet embeds a quoted tweet, append an Obsidian [!Quote] callout block.
+        if (tweet.quote) {
+            const q = tweet.quote;
+            const quoteIndent = indent;
+            const quoteTimestamp = formatTimestamp(q.timestamp) || 'unknown date';
+            const quoteDateLink = q.id
+                ? `[${quoteTimestamp}](${q.id})`
+                : `[${quoteTimestamp}]`;
+
+            const quoteAvatarMd = q.authorAvatarFile
+                ? `![[${q.authorAvatarFile}|18]]`
+                : (q.authorAvatarUrl ? `![|18](${q.authorAvatarUrl})` : '');
+            const quoteHandle = escapeMarkdownInlineText(q.authorHandle);
+
+            const lines = [];
+            // Callout header
+            lines.push(`${quoteIndent}> [!Quote]-`);
+            // Quoted tweet header line
+            lines.push(`${quoteIndent}> ${quoteAvatarMd}**${quoteHandle}** ${quoteDateLink}`);
+
+            // Quoted tweet text lines
+            const quoteTextLines = stripYouTubeUrlsFromLines(String(q.text || '').split("\n"))
+                .map(stripYouTubeUrlsFromLine)
+                .filter(line => line.trim().length > 0)
+                .map(line => {
+                    const formattedLine = wrapBareUrlsForMarkdown(line);
+                    const safeLine = escapeMarkdownInlineTextPreservingUrls(formattedLine);
+                    return `${quoteIndent}> ${safeLine}`;
+                });
+
+            if (quoteTextLines.length > 0) {
+                lines.push(...quoteTextLines);
+            }
+
+            // Quoted tweet photos
+            if (Array.isArray(q.photoFiles) && q.photoFiles.length > 0) {
+                const width = 400;
+                q.photoFiles
+                    .filter(Boolean)
+                    .forEach(name => {
+                        lines.push(`${quoteIndent}> ![[${name}|${width}]]`);
+                    });
+            }
+
+            // Quoted tweet videos
+            if (Array.isArray(q.videoFiles) && q.videoFiles.length > 0) {
+                q.videoFiles
+                    .filter(Boolean)
+                    .forEach(name => {
+                        lines.push(`${quoteIndent}> ![[${name}|vid-20]]`);
+                    });
+            }
+
+            // Quoted tweet voice posts (yt-dlp exported separately, same convention as main tweets).
+            if (q.isVoicePost && q.id) {
+                const restId = extractRestIdFromStatusUrl(q.id);
+                if (restId) {
+                    lines.push(`${quoteIndent}> ![[voice_${restId}.m4a|aud]]`);
+                }
+            }
+
+            if (lines.length > 0) {
+                content += "\n" + lines.join("\n");
             }
         }
 
