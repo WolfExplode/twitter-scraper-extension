@@ -93,8 +93,8 @@
             const href = window.location?.href || '';
             const u = new URL(href, window.location.origin);
             const rawQ = u.searchParams.get('q') || '';
-            const decoded = decodeURIComponent(rawQ);
-            const m = decoded.match(/from(?::|%3A)([A-Za-z0-9_]{1,15})/i);
+            const decoded = String(rawQ || '');
+            const m = decoded.match(/from:(\w{1,15})/i);
             if (m && m[1]) {
                 return '@' + m[1];
             }
@@ -104,7 +104,9 @@
 
         // Fallback: first tweet's handle in the results list.
         try {
-            const handleSpan = document.querySelector('article[data-testid="tweet"] div[data-testid="User-Name"] a[tabindex="-1"] span');
+            const handleSpan = document.querySelector(
+                'article[data-testid="tweet"] div[data-testid="User-Name"] a[tabindex="-1"] span'
+            );
             const txt = handleSpan?.innerText || handleSpan?.textContent || '';
             if (txt.trim()) return txt.trim();
         } catch {
@@ -152,6 +154,126 @@
             exportKey: 'account',
             rootRestId: ''
         };
+    }
+
+    // --- Search date range helpers (for shifting since:/until: windows) ---
+
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+    function parseSearchQueryDateToken(dateText) {
+        if (!dateText) return null;
+        const parts = String(dateText).split('-').map(p => parseInt(p, 10));
+        if (parts.length !== 3) return null;
+        const [y, m, d] = parts;
+        if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return null;
+        // Use UTC to avoid local timezone shifting the calendar date.
+        const dt = new Date(Date.UTC(y, m - 1, d));
+        if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;
+        return dt;
+    }
+
+    function formatSearchQueryDateToken(dt) {
+        if (!(dt instanceof Date) || isNaN(dt.getTime())) return '';
+        const y = dt.getUTCFullYear();
+        const m = dt.getUTCMonth() + 1;
+        const d = dt.getUTCDate();
+        // Keep a simple YYYY-M-D style; Twitter accepts both padded and unpadded.
+        return `${y}-${m}-${d}`;
+    }
+
+    function getCurrentSearchDateRangeFromLocation() {
+        try {
+            const href = window.location?.href || '';
+            const u = new URL(href, window.location.origin);
+            const rawQ = u.searchParams.get('q') || '';
+            const decoded = String(rawQ || '');
+
+            const sinceMatch = decoded.match(/\bsince:(\d{4}-\d{1,2}-\d{1,2})\b/i);
+            const untilMatch = decoded.match(/\buntil:(\d{4}-\d{1,2}-\d{1,2})\b/i);
+            if (!sinceMatch && !untilMatch) return null;
+
+            const sinceText = sinceMatch ? sinceMatch[1] : '';
+            const untilText = untilMatch ? untilMatch[1] : '';
+
+            const sinceDate = sinceText ? parseSearchQueryDateToken(sinceText) : null;
+            const untilDate = untilText ? parseSearchQueryDateToken(untilText) : null;
+
+            return {
+                query: decoded,
+                sinceText,
+                untilText,
+                sinceDate,
+                untilDate
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    // Human-readable description for UI
+    function describeCurrentSearchDateRange() {
+        const info = getCurrentSearchDateRangeFromLocation();
+        if (!info) return '';
+        const parts = [];
+        if (info.sinceText) parts.push(`since:${info.sinceText}`);
+        if (info.untilText) parts.push(`until:${info.untilText}`);
+        return parts.join(' ');
+    }
+
+    // Shift the current search ?q= date window left/right by approximately its own width.
+    // direction: +1 => forward in time, -1 => backward.
+    function shiftCurrentSearchDateRange(direction) {
+        if (!direction || (direction !== 1 && direction !== -1)) {
+            direction = 1;
+        }
+
+        // Only meaningful on search result / advanced search pages.
+        const mode = getPageModeFromLocation();
+        if (!(mode === 'search' || mode === 'search_advanced')) {
+            setUiStatus?.('Date range controls are only available on /search pages.');
+            return;
+        }
+
+        const info = getCurrentSearchDateRangeFromLocation();
+        if (!info || !info.sinceDate || !info.untilDate) {
+            setUiStatus?.('Could not find valid since:/until: dates in current search query.');
+            return;
+        }
+
+        const spanMs = info.untilDate.getTime() - info.sinceDate.getTime();
+        let spanDays = Math.round(spanMs / MS_PER_DAY);
+        if (!Number.isFinite(spanDays) || spanDays <= 0) {
+            spanDays = 15; // sensible default
+        }
+
+        const stepMs = spanDays * MS_PER_DAY * direction;
+
+        const newSince = new Date(info.sinceDate.getTime() + stepMs);
+        const newUntil = new Date(info.untilDate.getTime() + stepMs);
+
+        const newSinceText = formatSearchQueryDateToken(newSince);
+        const newUntilText = formatSearchQueryDateToken(newUntil);
+
+        if (!newSinceText || !newUntilText) {
+            setUiStatus?.('Failed to compute new search date range.');
+            return;
+        }
+
+        let newQuery = info.query;
+        newQuery = newQuery.replace(/\bsince:\d{4}-\d{1,2}-\d{1,2}\b/i, `since:${newSinceText}`);
+        newQuery = newQuery.replace(/\buntil:\d{4}-\d{1,2}-\d{1,2}\b/i, `until:${newUntilText}`);
+
+        try {
+            const href = window.location?.href || '';
+            const u = new URL(href, window.location.origin);
+            u.searchParams.set('q', newQuery);
+            const nextUrl = u.toString();
+            const desc = describeCurrentSearchDateRange();
+            setUiStatus?.(desc ? `Shifting search range to ${desc}` : 'Shifting search range…');
+            window.location.href = nextUrl;
+        } catch {
+            setUiStatus?.('Failed to update search URL with new date range.');
+        }
     }
 
     function stripUrlQuery(urlString) {
@@ -411,6 +533,12 @@
     const AUTO_SCROLL_BASE_TICK_MS = 850;
     const MIN_EFFECTIVE_SCROLL_STEP_PX = 80; // allows smaller increments even if UI min is higher
 
+    // Search-run safety limit: cap how many /status posts (root tweets) a multi-page search run will visit.
+    const DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS = 500;
+    const MIN_SEARCH_RUN_MAX_STATUS_POSTS = 30;
+    const MAX_SEARCH_RUN_MAX_STATUS_POSTS = 5000;
+    let searchRunMaxStatusPosts = DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS;
+
     // Optional: wait for translation plugins (e.g. Immersive Translate) to inject translated DOM.
     const DEFAULT_WAIT_FOR_IMMERSIVE_TRANSLATE = false;
     const DEFAULT_TRANSLATION_WAIT_MS = 6000;
@@ -503,6 +631,7 @@
         startTweetId: 'wxp_tw_scraper_start_tweet_id',
         startTweetExclusive: 'wxp_tw_scraper_start_tweet_exclusive',
         scrollStepPx: 'wxp_tw_scraper_scroll_step_px',
+        searchRunMaxStatusPosts: 'wxp_tw_scraper_search_run_max_status_posts',
         waitForImmersiveTranslate: 'wxp_tw_scraper_wait_for_immersive_translate',
         translationWaitMs: 'wxp_tw_scraper_translation_wait_ms',
         autoHarvestWithExtension: 'wxp_tw_scraper_auto_harvest_with_extension',
@@ -619,34 +748,58 @@
         return urls;
     }
 
-    async function collectAllSearchResultTweetUrlsWithScroll() {
+    async function collectAllSearchResultTweetUrlsWithScroll(maxTotalStatusPosts = Infinity) {
         const all = new Set();
         let lastSize = 0;
-        let stalledTicks = 0;
-        const maxTicks = 200;
+        let noProgressTicks = 0;
+        const maxTicks = 300;
+        const targetMax = Number.isFinite(maxTotalStatusPosts) ? Math.max(1, maxTotalStatusPosts | 0) : Infinity;
+
+        // Track scroll + document growth to avoid declaring "stalled" too early when
+        // the currently visible tweets are all previously scraped.
+        let lastScrollY = window.scrollY;
+        let lastScrollH = document.documentElement.scrollHeight;
 
         for (let tick = 0; tick < maxTicks; tick++) {
             const batch = collectSearchResultTweetUrls();
             for (const id of batch) {
                 all.add(id);
+                if (all.size >= targetMax) break;
             }
 
-            if (all.size > lastSize) {
+            if (all.size >= targetMax) break;
+
+            const sizeChanged = all.size > lastSize;
+            if (sizeChanged) {
                 lastSize = all.size;
-                stalledTicks = 0;
-            } else {
-                stalledTicks++;
             }
-
-            if (isEndOfTimelineVisible()) break;
-            if (stalledTicks >= 5) break;
 
             const beforeY = window.scrollY;
+            const beforeH = document.documentElement.scrollHeight;
             window.scrollBy(0, getScrapeScrollStepPx());
             const afterY = window.scrollY;
-            if (afterY === beforeY) {
-                stalledTicks++;
+            const afterH = document.documentElement.scrollHeight;
+
+            const scrolled = afterY !== beforeY;
+            const grew = afterH !== beforeH;
+
+            if (!sizeChanged && !scrolled && !grew) {
+                noProgressTicks++;
+            } else {
+                noProgressTicks = 0;
             }
+
+            lastScrollY = afterY;
+            lastScrollH = afterH;
+
+            // If we've clearly reached the end (end-of-timeline marker visible *and*
+            // no scroll/document growth), we can stop even if no new /status URLs
+            // were found.
+            if (isEndOfTimelineVisible() && !scrolled && !grew) break;
+
+            // Give up only after an extended period of zero progress to avoid
+            // missing a few unseen tweets near the bottom.
+            if (noProgressTicks >= 20) break;
 
             await sleep(SCRAPE_TICK_MS);
         }
@@ -1074,6 +1227,40 @@
 
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, Math.max(0, ms | 0)));
+    }
+
+    function loadSearchRunSettings() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEYS.searchRunMaxStatusPosts);
+            if (raw == null || raw === '') return;
+            searchRunMaxStatusPosts = clampNumber(
+                parseInt(raw, 10),
+                MIN_SEARCH_RUN_MAX_STATUS_POSTS,
+                MAX_SEARCH_RUN_MAX_STATUS_POSTS
+            );
+        } catch {
+            // ignore
+        }
+    }
+
+    function saveSearchRunSettings() {
+        try {
+            localStorage.setItem(
+                STORAGE_KEYS.searchRunMaxStatusPosts,
+                String(
+                    clampNumber(searchRunMaxStatusPosts, MIN_SEARCH_RUN_MAX_STATUS_POSTS, MAX_SEARCH_RUN_MAX_STATUS_POSTS) |
+                        0
+                )
+            );
+        } catch {
+            // ignore
+        }
+    }
+
+    function getSearchRunMaxStatusPosts() {
+        return (
+            clampNumber(searchRunMaxStatusPosts, MIN_SEARCH_RUN_MAX_STATUS_POSTS, MAX_SEARCH_RUN_MAX_STATUS_POSTS) | 0
+        );
     }
 
     function loadScrollStepSetting() {
@@ -2037,7 +2224,8 @@
         }
 
         setUiStatus('Collecting tweets from search results…');
-        const tweetQueue = await collectAllSearchResultTweetUrlsWithScroll();
+        const maxStatusPosts = getSearchRunMaxStatusPosts();
+        const tweetQueue = await collectAllSearchResultTweetUrlsWithScroll(maxStatusPosts);
         const filteredQueue = tweetQueue.filter(id => !scrapedIdSet.has(id) && !rememberedScrapedIdSet.has(id));
 
         if (!filteredQueue.length) {
@@ -2063,7 +2251,15 @@
         saveSearchRunState(state);
 
         const first = filteredQueue[0];
-        setUiStatus(`Search run: ${filteredQueue.length} tweets queued. Opening 1/${filteredQueue.length}…`);
+        if (filteredQueue.length >= maxStatusPosts) {
+            setUiStatus(
+                `Search run: ${filteredQueue.length} /status posts queued (limit reached: ${maxStatusPosts}). Opening 1/${filteredQueue.length}…`
+            );
+        } else {
+            setUiStatus(
+                `Search run: ${filteredQueue.length} /status posts queued. Opening 1/${filteredQueue.length}…`
+            );
+        }
         window.location.href = first;
     }
 

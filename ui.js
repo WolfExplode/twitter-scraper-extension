@@ -32,6 +32,7 @@ loadRememberScrapedIdsEnabledSetting();
 loadRememberedScrapedIds();
 loadStartTweetCheckpoint();
 loadScrollStepSetting();
+loadSearchRunSettings();
 loadTranslationSettings();
 loadAutoHarvestWithExtensionSetting();
 loadVoiceExportSettings();
@@ -266,6 +267,96 @@ scrollStepInput.onchange = () => {
 };
 scrollStepRow.appendChild(scrollStepInput);
 uiContainer.appendChild(scrollStepRow);
+
+const searchRunLimitRow = document.createElement('label');
+searchRunLimitRow.style.cssText = 'display:flex;align-items:center;gap:6px;font:12px system-ui, -apple-system, Segoe UI, Roboto, Arial;color:#111;user-select:none;';
+searchRunLimitRow.appendChild(document.createTextNode('Max /status posts per search run:'));
+const searchRunLimitInput = document.createElement('input');
+searchRunLimitInput.type = 'number';
+searchRunLimitInput.min = String(MIN_SEARCH_RUN_MAX_STATUS_POSTS);
+searchRunLimitInput.max = String(MAX_SEARCH_RUN_MAX_STATUS_POSTS);
+searchRunLimitInput.step = '50';
+searchRunLimitInput.value = String(getSearchRunMaxStatusPosts());
+searchRunLimitInput.style.cssText = 'width:86px;padding:4px 6px;border:1px solid #cbd5e1;border-radius:4px;font:12px system-ui, -apple-system, Segoe UI, Roboto, Arial;';
+searchRunLimitInput.onchange = () => {
+    searchRunMaxStatusPosts = clampNumber(
+        parseInt(searchRunLimitInput.value, 10),
+        MIN_SEARCH_RUN_MAX_STATUS_POSTS,
+        MAX_SEARCH_RUN_MAX_STATUS_POSTS
+    );
+    searchRunLimitInput.value = String(getSearchRunMaxStatusPosts());
+    saveSearchRunSettings();
+};
+searchRunLimitRow.appendChild(searchRunLimitInput);
+uiContainer.appendChild(searchRunLimitRow);
+
+// --- Search date range controls (since:/until:) ---
+try {
+    const mode = typeof getPageModeFromLocation === 'function' ? getPageModeFromLocation() : 'other';
+    const canShiftDates =
+        (mode === 'search' || mode === 'search_advanced') &&
+        typeof shiftCurrentSearchDateRange === 'function' &&
+        typeof describeCurrentSearchDateRange === 'function';
+
+    if (canShiftDates) {
+        const rangeRow = document.createElement('div');
+        rangeRow.style.cssText =
+            'display:flex;align-items:center;gap:4px;font:12px system-ui, -apple-system, Segoe UI, Roboto, Arial;color:#111;user-select:none;';
+
+        const label = document.createElement('span');
+        label.textContent = 'Search date range:';
+        rangeRow.appendChild(label);
+
+        const leftBtn = document.createElement('button');
+        leftBtn.textContent = '←';
+        leftBtn.title = 'Shift range ~1 window earlier';
+        leftBtn.style.cssText =
+            'padding:2px 6px;background:#e5e7eb;color:#111;border:1px solid #d1d5db;border-radius:4px;cursor:pointer;';
+
+        const rightBtn = document.createElement('button');
+        rightBtn.textContent = '→';
+        rightBtn.title = 'Shift range ~1 window later';
+        rightBtn.style.cssText =
+            'padding:2px 6px;background:#e5e7eb;color:#111;border:1px solid #d1d5db;border-radius:4px;cursor:pointer;';
+
+        const rangeText = document.createElement('span');
+        rangeText.style.cssText =
+            'margin-left:4px;color:#374151;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+
+        const refreshRangeText = () => {
+            try {
+                const desc = describeCurrentSearchDateRange?.() || '';
+                rangeText.textContent = desc || '(no since:/until: in query)';
+            } catch {
+                rangeText.textContent = '(date range unavailable)';
+            }
+        };
+
+        leftBtn.onclick = () => {
+            try {
+                shiftCurrentSearchDateRange(-1);
+            } catch {
+                /* ignore */
+            }
+        };
+        rightBtn.onclick = () => {
+            try {
+                shiftCurrentSearchDateRange(1);
+            } catch {
+                /* ignore */
+            }
+        };
+
+        rangeRow.appendChild(leftBtn);
+        rangeRow.appendChild(rightBtn);
+        rangeRow.appendChild(rangeText);
+
+        uiContainer.appendChild(rangeRow);
+        refreshRangeText();
+    }
+} catch {
+    // Ignore UI errors: never break the page if helpers are missing.
+}
 
 const pickStartButton = document.createElement('button');
 pickStartButton.textContent = 'Pick start tweet';
