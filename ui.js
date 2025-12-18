@@ -83,7 +83,11 @@ rememberCb.onchange = () => {
     rememberScrapedIdsEnabled = rememberCb.checked;
     saveRememberScrapedIdsEnabledSetting();
     // Re-seed dedupe depending on toggle state.
-    scrapedIdSet = rememberScrapedIdsEnabled ? new Set(rememberedScrapedIdSet) : new Set();
+    if (typeof scraperState !== 'undefined') {
+        scraperState.scrapedIdSet = rememberScrapedIdsEnabled ? new Set(rememberedScrapedIdSet) : new Set();
+    } else {
+        scrapedIdSet = rememberScrapedIdsEnabled ? new Set(rememberedScrapedIdSet) : new Set();
+    }
     setUiStatus(`Remember scraped IDs: ${rememberScrapedIdsEnabled ? 'ON' : 'OFF'} (${rememberedScrapedIdSet.size})`);
 };
 rememberRow.appendChild(rememberCb);
@@ -99,7 +103,11 @@ exportIdsBtn.textContent = 'Export IDs';
 exportIdsBtn.style.cssText = 'padding:6px 8px;background:#10b981;color:white;border:none;border-radius:4px;cursor:pointer;font:12px system-ui, -apple-system, Segoe UI, Roboto, Arial;';
 exportIdsBtn.onclick = () => {
     const ctx = computeRunContextFromCurrentPage();
-    exportRememberedScrapedIdsToJsonFile(ctx.exportKey || currentRunExportKey || 'account');
+    const exportKeySource =
+        (ctx && ctx.exportKey) ||
+        (typeof scraperState !== 'undefined' ? scraperState.currentRunExportKey : currentRunExportKey) ||
+        'account';
+    exportRememberedScrapedIdsToJsonFile(exportKeySource);
     setUiStatus(`Exported scraped IDs (${rememberedScrapedIdSet.size}).`);
 };
 
@@ -131,7 +139,13 @@ clearIdsBtn.onclick = () => {
     clearRememberedScrapedIds();
     updateRememberCount();
     // Also clear current run dedupe if it's based on remembered IDs.
-    if (rememberScrapedIdsEnabled) scrapedIdSet = new Set();
+    if (rememberScrapedIdsEnabled) {
+        if (typeof scraperState !== 'undefined') {
+            scraperState.scrapedIdSet = new Set();
+        } else {
+            scrapedIdSet = new Set();
+        }
+    }
     setUiStatus('Cleared remembered scraped IDs.');
 };
 
@@ -601,5 +615,4 @@ waitForBodyReady().then(() => {
 document.addEventListener('mousemove', onPickerMouseMove, true);
 document.addEventListener('click', onPickerClick, true);
 document.addEventListener('keydown', onPickerKeyDown, true);
-
 

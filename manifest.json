@@ -18,7 +18,7 @@
         "https://*.twitter.com/search-advanced*",
         "https://*.x.com/search-advanced*"
       ],
-      "js": ["scraper.js", "exporter.js", "ui.js", "main.js"],
+      "js": ["config.js", "storage.js", "search-runner.js", "tweet-parser.js", "scraper.js", "exporter.js", "ui.js", "main.js"],
       "run_at": "document_start",
       "world": "MAIN"
     }

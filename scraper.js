@@ -36,6 +36,57 @@
     let currentRunExportKey = 'account'; // used for filenames / exports
     let currentRunRootStatusRestId = ''; // for status mode
 
+    /**
+     * Grouped view of the primary scraper state. This serves as a single place to
+     * inspect and mutate core runtime variables (data, dedupe, run context, timer),
+     * while keeping existing code that references the legacy globals working.
+     *
+     * New code should prefer `scraperState.*` over the individual globals.
+     */
+    const scraperState = {
+        get scrapedData() { return scrapedData; },
+        set scrapedData(value) {
+            scrapedData = Array.isArray(value) ? value : [];
+        },
+
+        get scrapedIdSet() { return scrapedIdSet; },
+        set scrapedIdSet(value) {
+            if (value instanceof Set) {
+                scrapedIdSet = value;
+            } else if (Array.isArray(value)) {
+                scrapedIdSet = new Set(value);
+            } else {
+                scrapedIdSet = new Set();
+            }
+        },
+
+        get scrollInterval() { return scrollInterval; },
+        set scrollInterval(value) {
+            scrollInterval = value;
+        },
+
+        get currentRunMode() { return currentRunMode; },
+        set currentRunMode(value) {
+            currentRunMode = String(value || 'unknown');
+        },
+
+        get currentRunProfileHandle() { return currentRunProfileHandle; },
+        set currentRunProfileHandle(value) {
+            currentRunProfileHandle = String(value || '');
+        },
+
+        get currentRunExportKey() { return currentRunExportKey; },
+        set currentRunExportKey(value) {
+            const v = String(value || '').trim();
+            currentRunExportKey = v || 'account';
+        },
+
+        get currentRunRootStatusRestId() { return currentRunRootStatusRestId; },
+        set currentRunRootStatusRestId(value) {
+            currentRunRootStatusRestId = String(value || '');
+        }
+    };
+
 
     // --- Video interception (stable IDs; avoid blob URLs) ---
     // Map tweet rest_id -> Set<filename.mp4>
@@ -167,125 +218,7 @@
         };
     }
 
-    // --- Search date range helpers (for shifting since:/until: windows) ---
-
-    const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
-    function parseSearchQueryDateToken(dateText) {
-        if (!dateText) return null;
-        const parts = String(dateText).split('-').map(p => parseInt(p, 10));
-        if (parts.length !== 3) return null;
-        const [y, m, d] = parts;
-        if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return null;
-        // Use UTC to avoid local timezone shifting the calendar date.
-        const dt = new Date(Date.UTC(y, m - 1, d));
-        if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;
-        return dt;
-    }
-
-    function formatSearchQueryDateToken(dt) {
-        if (!(dt instanceof Date) || isNaN(dt.getTime())) return '';
-        const y = dt.getUTCFullYear();
-        const m = dt.getUTCMonth() + 1;
-        const d = dt.getUTCDate();
-        // Keep a simple YYYY-M-D style; Twitter accepts both padded and unpadded.
-        return `${y}-${m}-${d}`;
-    }
-
-    function getCurrentSearchDateRangeFromLocation() {
-        try {
-            const href = window.location?.href || '';
-            const u = new URL(href, window.location.origin);
-            const rawQ = u.searchParams.get('q') || '';
-            const decoded = String(rawQ || '');
-
-            const sinceMatch = decoded.match(/\bsince:(\d{4}-\d{1,2}-\d{1,2})\b/i);
-            const untilMatch = decoded.match(/\buntil:(\d{4}-\d{1,2}-\d{1,2})\b/i);
-            if (!sinceMatch && !untilMatch) return null;
-
-            const sinceText = sinceMatch ? sinceMatch[1] : '';
-            const untilText = untilMatch ? untilMatch[1] : '';
-
-            const sinceDate = sinceText ? parseSearchQueryDateToken(sinceText) : null;
-            const untilDate = untilText ? parseSearchQueryDateToken(untilText) : null;
-
-            return {
-                query: decoded,
-                sinceText,
-                untilText,
-                sinceDate,
-                untilDate
-            };
-        } catch {
-            return null;
-        }
-    }
-
-    // Human-readable description for UI
-    function describeCurrentSearchDateRange() {
-        const info = getCurrentSearchDateRangeFromLocation();
-        if (!info) return '';
-        const parts = [];
-        if (info.sinceText) parts.push(`since:${info.sinceText}`);
-        if (info.untilText) parts.push(`until:${info.untilText}`);
-        return parts.join(' ');
-    }
-
-    // Shift the current search ?q= date window left/right by approximately its own width.
-    // direction: +1 => forward in time, -1 => backward.
-    function shiftCurrentSearchDateRange(direction) {
-        if (!direction || (direction !== 1 && direction !== -1)) {
-            direction = 1;
-        }
-
-        // Only meaningful on search result / advanced search pages.
-        const mode = getPageModeFromLocation();
-        if (!(mode === 'search' || mode === 'search_advanced')) {
-            setUiStatus?.('Date range controls are only available on /search pages.');
-            return;
-        }
-
-        const info = getCurrentSearchDateRangeFromLocation();
-        if (!info || !info.sinceDate || !info.untilDate) {
-            setUiStatus?.('Could not find valid since:/until: dates in current search query.');
-            return;
-        }
-
-        const spanMs = info.untilDate.getTime() - info.sinceDate.getTime();
-        let spanDays = Math.round(spanMs / MS_PER_DAY);
-        if (!Number.isFinite(spanDays) || spanDays <= 0) {
-            spanDays = 15; // sensible default
-        }
-
-        const stepMs = spanDays * MS_PER_DAY * direction;
-
-        const newSince = new Date(info.sinceDate.getTime() + stepMs);
-        const newUntil = new Date(info.untilDate.getTime() + stepMs);
-
-        const newSinceText = formatSearchQueryDateToken(newSince);
-        const newUntilText = formatSearchQueryDateToken(newUntil);
-
-        if (!newSinceText || !newUntilText) {
-            setUiStatus?.('Failed to compute new search date range.');
-            return;
-        }
-
-        let newQuery = info.query;
-        newQuery = newQuery.replace(/\bsince:\d{4}-\d{1,2}-\d{1,2}\b/i, `since:${newSinceText}`);
-        newQuery = newQuery.replace(/\buntil:\d{4}-\d{1,2}-\d{1,2}\b/i, `until:${newUntilText}`);
-
-        try {
-            const href = window.location?.href || '';
-            const u = new URL(href, window.location.origin);
-            u.searchParams.set('q', newQuery);
-            const nextUrl = u.toString();
-            const desc = describeCurrentSearchDateRange();
-            setUiStatus?.(desc ? `Shifting search range to ${desc}` : 'Shifting search range…');
-            window.location.href = nextUrl;
-        } catch {
-            setUiStatus?.('Failed to update search URL with new date range.');
-        }
-    }
+    // Search date range helpers now live in `search-runner.js`.
 
     function stripUrlQuery(urlString) {
         try {
@@ -441,8 +374,18 @@
         try {
             if (!isLikelyTwitterGraphqlApiUrl(urlString)) return;
             if (!responseText || typeof responseText !== 'string') return;
-            // Fast reject to avoid parsing non-tweet payloads.
-            if (!responseText.includes('"rest_id"') || !responseText.includes('"video_info"')) return;
+            // Fast reject to avoid parsing non-tweet payloads. We accept either traditional
+            // video payloads (video_info) or newer audio/voice payloads (audio_info/voice_info).
+            if (
+                !responseText.includes('"rest_id"') ||
+                !(
+                    responseText.includes('"video_info"') ||
+                    responseText.includes('"audio_info"') ||
+                    responseText.includes('"voice_info"')
+                )
+            ) {
+                return;
+            }
             const json = JSON.parse(responseText);
             scanGraphqlJsonForTweetVideos(json);
         } catch {
@@ -525,44 +468,29 @@
     installNetworkInterceptors();
 
     // Scroll step (constant; avoids zoom-dependent viewport math)
-    const DEFAULT_SCROLL_STEP_PX = 500;
-    const MIN_SCROLL_STEP_PX = 200;
-    const MAX_SCROLL_STEP_PX = 6000;
+    // Constants are defined centrally in `config.js` (DEFAULT_SCROLL_STEP_PX, MIN_SCROLL_STEP_PX, MAX_SCROLL_STEP_PX).
     let scrollStepPx = DEFAULT_SCROLL_STEP_PX;
 
     // Page "zoom" (CSS zoom) to load more content per viewport during scraping.
     // Note: JS cannot change the browser's UI zoom level; this applies a CSS zoom to the page instead.
-    const SCRAPE_PAGE_ZOOM_PERCENT = 100;
-    const RESET_PAGE_ZOOM_PERCENT = 100;
+    // Defaults (SCRAPE_PAGE_ZOOM_PERCENT, RESET_PAGE_ZOOM_PERCENT) are defined in `config.js`.
     let appliedPageZoomTarget = null; // 'body' | 'root' | null
 
     // Smoother scrolling: tick more often, but scroll less per tick (preserve px/sec feel).
-    // These are intentionally separate so UI "Scroll step" can remain a simple single value.
-    const SCRAPE_TICK_MS = 600; // was 1500
-    const SCRAPE_SCROLL_BASE_TICK_MS = 1500;
-    const AUTO_SCROLL_TICK_MS = 200; // was 850
-    const AUTO_SCROLL_BASE_TICK_MS = 850;
-    const MIN_EFFECTIVE_SCROLL_STEP_PX = 80; // allows smaller increments even if UI min is higher
-
-    // Search-run safety limit: cap how many /status posts (root tweets) a multi-page search run will visit.
-    const DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS = 50;
-    const MIN_SEARCH_RUN_MAX_STATUS_POSTS = 15;
-    const MAX_SEARCH_RUN_MAX_STATUS_POSTS = 20;
+    // These timing constants are defined centrally in `config.js`.
     let searchRunMaxStatusPosts = DEFAULT_SEARCH_RUN_MAX_STATUS_POSTS;
 
     // Optional: wait for translation plugins (e.g. Immersive Translate) to inject translated DOM.
-    const DEFAULT_WAIT_FOR_IMMERSIVE_TRANSLATE = false;
-    // Use a long default window so translation extensions have ample time to inject DOM
-    // before we fall back to original text.
-    const DEFAULT_TRANSLATION_WAIT_MS = 15000;
-    const MIN_TRANSLATION_WAIT_MS = 0;
-    const MAX_TRANSLATION_WAIT_MS = 15000;
-    const TRANSLATION_POLL_MS = 50;
+    // Defaults and bounds are defined in `config.js`.
     let waitForImmersiveTranslate = DEFAULT_WAIT_FOR_IMMERSIVE_TRANSLATE;
     let translationWaitMs = DEFAULT_TRANSLATION_WAIT_MS;
     // Per-tweet deferral tracking so we don't permanently capture the original before translation arrives.
     // tweetId -> { firstSeenMs: number, defers: number }
     let translationDeferById = new Map();
+    // Track when translation appears to be stalled on a status page so we can abort a search run
+    // before the tab grinds to a halt. Limit is defined in `config.js`.
+    let untranslatedStatusTweetStreak = 0;
+    let translationStallOnStatusPage = false;
 
     /**
      * Fetch or initialize the per-tweet deferral entry, resetting very stale entries so that
@@ -595,16 +523,12 @@
     let startFromTweetExclusive = false; // if true: resume *after* this tweet (skip the match)
     let hasReachedStartTweet = false;
 
-    // Auto-stop detection
+    // Auto-stop detection (defaults are defined in `config.js`)
     let autoStopEnabled = true;
     let autoDownloadOnAutoStop = true;
     let consecutiveNoNewTicks = 0;
     let lastScrollY = 0;
     let lastScrollHeight = 0;
-    const MAX_NO_NEW_TICKS = 12; // ~12s with 750ms interval
-    // Extra guard: if Twitter stops loading new timeline elements, stop quickly instead of "busy scrolling".
-    const TIMELINE_NO_NEW_ELEMENT_PAUSE_MS = 1100; // ~1s
-    const TIMELINE_LOAD_WAIT_MS = 10000; // wait up to 10s for Twitter to append more elements
     let timelineObserver = null;
     let lastTimelineNewElementMs = 0;
     let lastTweetDomCount = 0;
@@ -638,108 +562,8 @@
     let autoScrollPriorOutline = '';
     let autoScrollPriorOutlineOffset = '';
     const AUTO_SCROLL_HIGHLIGHT_STYLE = '3px solid #f59e0b';
-    const AUTO_SCROLL_MAX_TICKS = 12000; // safety limit (~85 minutes at 425ms)
 
-    const STORAGE_KEYS = {
-        startTweetId: 'wxp_tw_scraper_start_tweet_id',
-        startTweetExclusive: 'wxp_tw_scraper_start_tweet_exclusive',
-        scrollStepPx: 'wxp_tw_scraper_scroll_step_px',
-        searchRunMaxStatusPosts: 'wxp_tw_scraper_search_run_max_status_posts',
-        waitForImmersiveTranslate: 'wxp_tw_scraper_wait_for_immersive_translate',
-        translationWaitMs: 'wxp_tw_scraper_translation_wait_ms',
-        autoHarvestWithExtension: 'wxp_tw_scraper_auto_harvest_with_extension',
-        exportVoiceYtDlp: 'wxp_tw_scraper_export_voice_ytdlp',
-        ytDlpCookiesBrowser: 'wxp_tw_scraper_ytdlp_cookies_browser',
-        rememberScrapedIdsEnabled: 'wxp_tw_scraper_remember_scraped_ids_enabled',
-        rememberedScrapedIds: 'wxp_tw_scraper_remembered_scraped_ids_v1',
-        searchRunState: 'wxp_tw_scraper_search_run_state_v1',
-        searchAggregate: 'wxp_tw_scraper_search_aggregate_v1'
-    };
-
-    // Cross-page search run coordination (search results -> status pages -> back)
-    function loadSearchRunState() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEYS.searchRunState);
-            if (!raw) return null;
-            const parsed = JSON.parse(raw);
-            if (!parsed || typeof parsed !== 'object') return null;
-            if (!Array.isArray(parsed.tweetQueue)) parsed.tweetQueue = [];
-            parsed.currentIndex = Number.isFinite(parsed.currentIndex) ? parsed.currentIndex | 0 : 0;
-            parsed.paused = !!parsed.paused;
-            return parsed;
-        } catch {
-            return null;
-        }
-    }
-
-    function saveSearchRunState(state) {
-        if (!state) return;
-        try {
-            const payload = {
-                version: 1,
-                mode: state.mode || 'search',
-                searchUrl: state.searchUrl || '',
-                exportKey: state.exportKey || 'account',
-                ownerHandle: state.ownerHandle || '',
-                tweetQueue: Array.isArray(state.tweetQueue) ? state.tweetQueue : [],
-                currentIndex: Number.isFinite(state.currentIndex) ? state.currentIndex | 0 : 0,
-                startedAt: state.startedAt || new Date().toISOString(),
-                done: !!state.done,
-                paused: !!state.paused
-            };
-            localStorage.setItem(STORAGE_KEYS.searchRunState, JSON.stringify(payload));
-        } catch {
-            // ignore
-        }
-    }
-
-    function clearSearchRunState() {
-        try {
-            localStorage.removeItem(STORAGE_KEYS.searchRunState);
-        } catch {
-            // ignore
-        }
-    }
-
-    // Aggregated media data across a search run (for single *_avatars.tsv + *_download_media.cmd export)
-    function loadSearchAggregate() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEYS.searchAggregate);
-            if (!raw) {
-                return { exportKey: '', ownerHandle: '', tweets: [] };
-            }
-            const parsed = JSON.parse(raw);
-            if (!parsed || typeof parsed !== 'object') {
-                return { exportKey: '', ownerHandle: '', tweets: [] };
-            }
-            if (!Array.isArray(parsed.tweets)) parsed.tweets = [];
-            return parsed;
-        } catch {
-            return { exportKey: '', ownerHandle: '', tweets: [] };
-        }
-    }
-
-    function saveSearchAggregate(agg) {
-        if (!agg) return;
-        try {
-            const payload = {
-                exportKey: agg.exportKey || '',
-                ownerHandle: agg.ownerHandle || '',
-                tweets: Array.isArray(agg.tweets) ? agg.tweets : []
-            };
-            localStorage.setItem(STORAGE_KEYS.searchAggregate, JSON.stringify(payload));
-        } catch {
-            // ignore (quota etc.)
-        }
-    }
-
-    function clearSearchAggregate() {
-        try {
-            localStorage.removeItem(STORAGE_KEYS.searchAggregate);
-        } catch {
-            // ignore
-        }
-    }
+    // Cross-page search run coordination helpers now live in `storage.js`.
 
     function getNormalizedCurrentStatusUrl() {
         return normalizeStatusUrl(window.location?.href || '');
@@ -881,23 +705,6 @@
     let highlightScrapedEnabled = false;
     let scrapedHighlightObserver = null;
 
-    function loadHighlightScrapedSetting() {
-        try {
-            const raw = localStorage.getItem('wxp_tw_scraper_highlight_scraped');
-            highlightScrapedEnabled = raw === 'true' || raw === '1';
-        } catch {
-            highlightScrapedEnabled = false;
-        }
-    }
-
-    function saveHighlightScrapedSetting() {
-        try {
-            localStorage.setItem('wxp_tw_scraper_highlight_scraped', highlightScrapedEnabled ? '1' : '0');
-        } catch {
-            // ignore
-        }
-    }
-
     function applyScrapedHighlight(tweetEl) {
         if (!tweetEl || tweetEl.classList.contains(SCRAPED_HIGHLIGHT_CLASS)) return;
         tweetEl.classList.add(SCRAPED_HIGHLIGHT_CLASS);
@@ -960,24 +767,6 @@
         scrapedHighlightObserver = null;
     }
 
-    function loadRememberScrapedIdsEnabledSetting() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEYS.rememberScrapedIdsEnabled);
-            if (raw == null || raw === '') return;
-            rememberScrapedIdsEnabled = raw === '1' || raw === 'true';
-        } catch {
-            // ignore
-        }
-    }
-
-    function saveRememberScrapedIdsEnabledSetting() {
-        try {
-            localStorage.setItem(STORAGE_KEYS.rememberScrapedIdsEnabled, rememberScrapedIdsEnabled ? '1' : '0');
-        } catch {
-            // ignore
-        }
-    }
-
     function parseRememberedIdsPayload(raw) {
         // Accept:
         // - newline-separated IDs
@@ -1004,28 +793,7 @@
             .filter(Boolean);
     }
 
-    function loadRememberedScrapedIds() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEYS.rememberedScrapedIds);
-            const ids = parseRememberedIdsPayload(raw);
-            rememberedScrapedIdSet = new Set(ids);
-            // Seed the runtime dedupe set so helper waits (translation polling etc) already skip remembered IDs.
-            scrapedIdSet = rememberScrapedIdsEnabled ? new Set(rememberedScrapedIdSet) : new Set();
-        } catch {
-            rememberedScrapedIdSet = new Set();
-        }
-    }
-
-    function saveRememberedScrapedIdsNow() {
-        if (!rememberScrapedIdsEnabled) return;
-        try {
-            // Store as newline-separated text to minimize JSON overhead.
-            const payload = Array.from(rememberedScrapedIdSet).join('\n');
-            localStorage.setItem(STORAGE_KEYS.rememberedScrapedIds, payload);
-        } catch {
-            // ignore (quota, etc.)
-        }
-    }
+    // Remembered IDs helpers (load/save/clear) now live in `storage.js`.
 
     function scheduleSaveRememberedScrapedIds() {
         if (!rememberScrapedIdsEnabled) return;
@@ -1242,33 +1010,7 @@
         return new Promise(resolve => setTimeout(resolve, Math.max(0, ms | 0)));
     }
 
-    function loadSearchRunSettings() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEYS.searchRunMaxStatusPosts);
-            if (raw == null || raw === '') return;
-            searchRunMaxStatusPosts = clampNumber(
-                parseInt(raw, 10),
-                MIN_SEARCH_RUN_MAX_STATUS_POSTS,
-                MAX_SEARCH_RUN_MAX_STATUS_POSTS
-            );
-        } catch {
-            // ignore
-        }
-    }
-
-    function saveSearchRunSettings() {
-        try {
-            localStorage.setItem(
-                STORAGE_KEYS.searchRunMaxStatusPosts,
-                String(
-                    clampNumber(searchRunMaxStatusPosts, MIN_SEARCH_RUN_MAX_STATUS_POSTS, MAX_SEARCH_RUN_MAX_STATUS_POSTS) |
-                        0
-                )
-            );
-        } catch {
-            // ignore
-        }
-    }
+    // Search run settings helpers now live in `storage.js`.
 
     function getSearchRunMaxStatusPosts() {
         return (
@@ -1276,23 +1018,7 @@
         );
     }
 
-    function loadScrollStepSetting() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEYS.scrollStepPx);
-            if (raw == null || raw === '') return;
-            scrollStepPx = clampNumber(parseInt(raw, 10), MIN_SCROLL_STEP_PX, MAX_SCROLL_STEP_PX);
-        } catch {
-            // ignore
-        }
-    }
-
-    function saveScrollStepSetting() {
-        try {
-            localStorage.setItem(STORAGE_KEYS.scrollStepPx, String(scrollStepPx));
-        } catch {
-            // ignore
-        }
-    }
+    // Scroll step settings helpers now live in `storage.js`.
 
     function getScrollStepPx() {
         return clampNumber(scrollStepPx, MIN_SCROLL_STEP_PX, MAX_SCROLL_STEP_PX);
@@ -1344,28 +1070,7 @@
         return getEffectiveScrollStepPxForTick(AUTO_SCROLL_TICK_MS, AUTO_SCROLL_BASE_TICK_MS);
     }
 
-    function loadTranslationSettings() {
-        try {
-            const rawEnabled = localStorage.getItem(STORAGE_KEYS.waitForImmersiveTranslate);
-            if (rawEnabled != null) waitForImmersiveTranslate = rawEnabled === 'true';
-
-            const rawWait = localStorage.getItem(STORAGE_KEYS.translationWaitMs);
-            if (rawWait != null && rawWait !== '') {
-                translationWaitMs = clampNumber(parseInt(rawWait, 10), MIN_TRANSLATION_WAIT_MS, MAX_TRANSLATION_WAIT_MS);
-            }
-        } catch {
-            // ignore
-        }
-    }
-
-    function saveTranslationSettings() {
-        try {
-            localStorage.setItem(STORAGE_KEYS.waitForImmersiveTranslate, String(!!waitForImmersiveTranslate));
-            localStorage.setItem(STORAGE_KEYS.translationWaitMs, String(translationWaitMs | 0));
-        } catch {
-            // ignore
-        }
-    }
+    // Translation settings helpers now live in `storage.js`.
 
     function getTranslationWaitMs() {
         return clampNumber(translationWaitMs, MIN_TRANSLATION_WAIT_MS, MAX_TRANSLATION_WAIT_MS) | 0;
@@ -1563,32 +1268,7 @@
             : `Start tweet: ${startFromTweetId}`;
     }
 
-    function loadStartTweetCheckpoint() {
-        try {
-            const savedId = localStorage.getItem(STORAGE_KEYS.startTweetId);
-            const savedExclusive = localStorage.getItem(STORAGE_KEYS.startTweetExclusive);
-            if (savedId) {
-                startFromTweetId = savedId;
-                startFromTweetExclusive = savedExclusive === 'true';
-            }
-        } catch {
-            // ignore
-        }
-    }
-
-    function saveStartTweetCheckpoint() {
-        try {
-            if (!startFromTweetId) {
-                localStorage.removeItem(STORAGE_KEYS.startTweetId);
-                localStorage.removeItem(STORAGE_KEYS.startTweetExclusive);
-                return;
-            }
-            localStorage.setItem(STORAGE_KEYS.startTweetId, startFromTweetId);
-            localStorage.setItem(STORAGE_KEYS.startTweetExclusive, String(!!startFromTweetExclusive));
-        } catch {
-            // ignore
-        }
-    }
+    // Start tweet checkpoint helpers now live in `storage.js`.
 
     function isEndOfTimelineVisible() {
         // Best-effort: detect "end" messaging Twitter/X sometimes shows.
@@ -1736,11 +1416,6 @@
         return escaped.replace(/\u001AURL(\d+)\u001A/g, (_, i) => urls[Number(i)] || '');
     }
 
-    function getTweetIdFromTweetEl(tweetEl) {
-        const a = tweetEl?.querySelector?.('a[href*="/status/"]');
-        return normalizeStatusUrl(a?.href || '');
-    }
-
     function clearStartTweetSelection() {
         startFromTweetId = null;
         startFromTweetExclusive = false;
@@ -1827,510 +1502,14 @@
         }
     }
 
-    function extractAvatarUrl(tweetEl) {
-        if (!tweetEl) return '';
-
-        // Prefer the explicit avatar container (stable testid).
-        const img =
-            tweetEl.querySelector('[data-testid="Tweet-User-Avatar"] img[src^="http"]') ||
-            tweetEl.querySelector('[data-testid^="UserAvatar-Container"] img[src^="http"]') ||
-            tweetEl.querySelector('img[src*="pbs.twimg.com/profile_images/"]');
-
-        const directSrc = img?.getAttribute?.('src') || '';
-        if (directSrc) return directSrc;
-
-        // Fallback: some avatars may be set as background-image on a nested div.
-        const bgEl =
-            tweetEl.querySelector('[data-testid="Tweet-User-Avatar"] div[style*="background-image"]') ||
-            tweetEl.querySelector('div[style*="background-image"][style*="profile_images"]');
-
-        const style = bgEl?.getAttribute?.('style') || '';
-        const match = style.match(/background-image:\s*url\(["']?([^"')]+)["']?\)/i);
-        return match?.[1] || '';
-    }
-
-    function normalizeAvatarUrlTo200x200(urlString) {
-        // X often renders e.g. ".../P__Vdz3r_bigger.jpg" in the DOM.
-        // A 200x200 variant typically exists at ".../P__Vdz3r_200x200.jpg".
-        // This keeps the same path/extension/query but swaps the size suffix.
-        const raw = String(urlString || '').trim();
-        if (!raw) return '';
-        try {
-            const u = new URL(raw);
-            const path = u.pathname || '';
-            const newPath = path.replace(
-                /\/([^\/]+?)(?:_(?:normal|bigger|mini|400x400|200x200))?(\.[a-z0-9]+)$/i,
-                (_m, base, ext) => `/${base}_200x200${ext}`
-            );
-            u.pathname = newPath;
-            return u.toString();
-        } catch {
-            return raw.replace(
-                /\/([^\/]+?)(?:_(?:normal|bigger|mini|400x400|200x200))?(\.[a-z0-9]+)(\?.*)?$/i,
-                (_m, base, ext, q) => `/${base}_200x200${ext}${q || ''}`
-            );
-        }
-    }
-
-    function sanitizeFilenameComponent(s) {
-        // Windows-safe filename component: remove reserved characters and trim.
-        return String(s || '')
-            .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 180);
-    }
-
-    function avatarFilenameFromUrlAndHandle(avatarUrl, authorHandle) {
-        // Example avatar URL:
-        // https://pbs.twimg.com/profile_images/1950538056639094785/P__Vdz3r_200x200.jpg
-        // -> avatar_ayamehtbt_P__Vdz3r_200x200.jpg
-        if (!avatarUrl) return '';
-        const handleRaw = String(authorHandle || '').replace(/^@/, '');
-        const handle = sanitizeFilenameComponent(handleRaw || 'user');
-
-        let baseName = '';
-        let ext = 'jpg';
-        try {
-            const u = new URL(avatarUrl);
-            const parts = (u.pathname || '').split('/').filter(Boolean);
-            baseName = parts[parts.length - 1] || '';
-        } catch {
-            const parts = String(avatarUrl).split('/').filter(Boolean);
-            baseName = parts[parts.length - 1] || '';
-        }
-
-        // Strip query/hash and extract extension.
-        baseName = baseName.split('?')[0].split('#')[0];
-        const dot = baseName.lastIndexOf('.');
-        if (dot > 0 && dot < baseName.length - 1) {
-            ext = baseName.slice(dot + 1).toLowerCase() || 'jpg';
-            baseName = baseName.slice(0, dot);
-        }
-        if (ext === 'jpeg') ext = 'jpg';
-        if (!['jpg', 'png', 'webp', 'gif'].includes(ext)) ext = 'jpg';
-
-        // If this is a default profile image, use a shared filename (no handle) to de-duplicate.
-        if (/default_profile/i.test(baseName)) {
-            return 'avatar_default_profile_200x200.png';
-        }
-
-        const safeBase = sanitizeFilenameComponent(baseName || 'avatar');
-        const filename = `avatar_${handle}_${safeBase}.${ext}`;
-        return filename;
-    }
-
-    function normalizeTwitterMediaFilenameFromUrl(urlString) {
-        // Accepts URLs like:
-        // - https://pbs.twimg.com/media/G74vDW1bEAAT6aD?format=jpg&name=small
-        // - https://pbs.twimg.com/media/G74vDW1bEAAT6aD.jpg
-        // Returns: "G74vDW1bEAAT6aD.jpg" (or png/webp/gif when detectable)
-        if (!urlString || typeof urlString !== 'string') return '';
-        if (!urlString.includes('pbs.twimg.com/media/')) return '';
-
-        try {
-            const u = new URL(urlString);
-            const pathParts = (u.pathname || '').split('/').filter(Boolean);
-            const last = pathParts[pathParts.length - 1] || '';
-            if (!last) return '';
-
-            let base = last;
-            let extFromPath = '';
-            const dotIdx = last.lastIndexOf('.');
-            if (dotIdx > 0 && dotIdx < last.length - 1) {
-                base = last.slice(0, dotIdx);
-                extFromPath = last.slice(dotIdx + 1);
-            }
-
-            // Twitter uses ?format=jpg|png|webp|gif on /media/ URLs.
-            let ext = (u.searchParams.get('format') || extFromPath || 'jpg').toLowerCase();
-            if (ext === 'jpeg') ext = 'jpg';
-            if (!['jpg', 'png', 'gif', 'webp'].includes(ext)) ext = 'jpg';
-
-            // Media IDs are usually URL-safe base64-ish / snowflake-ish strings, keep conservative.
-            if (!/^[a-z0-9_-]+$/i.test(base)) return '';
-
-            return `${base}.${ext}`;
-        } catch {
-            // Non-URL strings: best-effort regex.
-            const m = urlString.match(/pbs\.twimg\.com\/media\/([a-z0-9_-]+)(?:\.[a-z0-9]+)?(?:\?|$)/i);
-            if (!m) return '';
-            return `${m[1]}.jpg`;
-        }
-    }
-
-    function extractTweetPhotoFilenames(tweetEl) {
-        // Collect filenames that match how your downloader saves them (e.g. G74vDW1bEAAT6aD.jpg).
-        // For top-level tweets that contain a quoted-tweet card, we *exclude* media that lives
-        // inside the quote card; that media is attached to the quoted tweet instead.
-        if (!tweetEl) return [];
-
-        const out = new Set();
-
-        // Pre-compute any embedded quote card containers so we can skip media inside them.
-        const quoteCardEls = findQuoteCardElements?.(tweetEl) || [];
-        const isInsideQuoteCard = (node) => {
-            if (!node || quoteCardEls.length === 0) return false;
-            for (const card of quoteCardEls) {
-                if (card && card.contains(node)) return true;
-            }
-            return false;
-        };
-
-        // 1) Direct <img> tags (common).
-        tweetEl.querySelectorAll('img[src*="pbs.twimg.com/media/"]').forEach(img => {
-            if (isInsideQuoteCard(img)) return;
-            const src = img.getAttribute('src') || '';
-            const filename = normalizeTwitterMediaFilenameFromUrl(src);
-            if (filename) out.add(filename);
-        });
-
-        // 2) Background-image styles (some layouts use this for photos).
-        tweetEl.querySelectorAll('[style*="pbs.twimg.com/media/"]').forEach(el => {
-            if (isInsideQuoteCard(el)) return;
-            const style = el.getAttribute('style') || '';
-            const matches = style.match(/url\(["']?(https?:\/\/pbs\.twimg\.com\/media\/[^"')]+)["']?\)/gi) || [];
-            matches.forEach(m => {
-                const urlMatch = m.match(/url\(["']?([^"')]+)["']?\)/i);
-                const urlString = urlMatch?.[1] || '';
-                const filename = normalizeTwitterMediaFilenameFromUrl(urlString);
-                if (filename) out.add(filename);
-            });
-        });
-
-        return Array.from(out);
-    }
-
-    /**
-     * Extract poll metadata (options, percentages, summary) from a tweet element.
-     *
-     * Handles the "cardPoll" layout as seen in current X DOM:
-     *   <div data-testid="cardPoll">
-     *     <ul role="list">
-     *       <li role="listitem"> ... option label + percent ... </li>
-     *       ...
-     *     </ul>
-     *     <div>80 votes · Final results</div>
-     *   </div>
-     */
-    function extractPollFromTweetElement(tweetEl) {
-        if (!tweetEl) return null;
-
-        const pollRoot = tweetEl.querySelector('[data-testid="cardPoll"]');
-        if (!pollRoot) return null;
-
-        const options = [];
-
-        const items = pollRoot.querySelectorAll('li[role="listitem"]');
-        items.forEach(li => {
-            if (!li) return;
-
-            // Best-effort: option label is usually the first dir="ltr" text block inside the item.
-            let label = '';
-            const labelBlock = li.querySelector('div[dir="ltr"]');
-            if (labelBlock) {
-                label = (labelBlock.innerText || labelBlock.textContent || '').trim();
-            } else {
-                label = (li.innerText || li.textContent || '').trim();
-            }
-
-            // Percent text is often in a trailing container with a number + "%" (e.g. "32.5%").
-            let percent = '';
-            const percentBlock = li.querySelector('div[dir="ltr"] span');
-            if (percentBlock) {
-                const raw = (percentBlock.innerText || percentBlock.textContent || '').trim();
-                const m = raw.match(/[\d.,]+\s*%/);
-                if (m) percent = m[0].replace(/\s+/g, '');
-            }
-
-            if (label) {
-                options.push({
-                    label,
-                    percent
-                });
-            }
-        });
-
-        if (options.length === 0) return null;
-
-        // Poll summary line (e.g. "80 votes · Final results").
-        let summary = '';
-        const summaryBlock = pollRoot.querySelector('div[dir="ltr"]');
-        if (summaryBlock) {
-            summary = (summaryBlock.innerText || summaryBlock.textContent || '').trim();
-        }
-
-        return { options, summary };
-    }
-
-    /**
-     * Locate embedded "quote tweet" cards inside a tweet article.
-     *
-     * In X's current DOM, quote tweets render as a small card with a "Quote" label and a
-     * clickable container (role="link") that holds avatar, handle, tweet text and media.
-     *
-     * Example (abridged):
-     *   <div aria-labelledby="id__3p48iv... id__4im8v0..." id="id__0m3oh2...">
-     *     <div id="id__3p48iv...">
-     *       <div dir="ltr">Quote</div>
-     *       <div tabindex="0" role="link"> ... quoted tweet content ... </div>
-     *     </div>
-     *   </div>
-     *
-     * We return the innermost card container(s) (the role="link" elements).
-     */
-    function findQuoteCardElements(tweetEl) {
-        if (!tweetEl) return [];
-
-        const cards = [];
-
-        // Scan small-ish candidate set: containers that group "Quote" label + card.
-        const containers = tweetEl.querySelectorAll('div[aria-labelledby]');
-        containers.forEach(container => {
-            if (!container) return;
-
-            // Look for a nearby label whose text is exactly "Quote" (English locale).
-            const labelEl =
-                container.querySelector('div[dir="ltr"]') ||
-                container.querySelector('span[dir="ltr"]') ||
-                container.querySelector('div') ||
-                container.querySelector('span');
-
-            const labelText = (labelEl?.innerText || labelEl?.textContent || '').trim();
-            if (!/^quote$/i.test(labelText)) return;
-
-            const cardEl = container.querySelector('div[role="link"]');
-            if (cardEl) cards.push(cardEl);
-        });
-
-        return cards;
-    }
-
-    /**
-     * Extract a minimal tweet-like object for a quoted tweet embedded inside a tweet article.
-     * Returns null when no quote is present.
-     */
-    function extractQuoteTweetFromTweetElement(tweetEl) {
-        if (!tweetEl) return null;
-
-        const cards = findQuoteCardElements(tweetEl);
-        if (!cards || cards.length === 0) return null;
-
-        // X only displays a single quoted tweet per post today; we take the first card.
-        const card = cards[0];
-
-        const tweetLinkElement = card.querySelector('a[href*="/status/"]');
-        const tweetId = normalizeStatusUrl(tweetLinkElement?.href || '');
-
-        const tweetTextElement = card.querySelector('[data-testid="tweetText"]');
-        const timeElement = card.querySelector('time');
-
-        // Extract display name + handle from the compact quote card layout.
-        let authorName = '';
-        let authorHandle = '';
-        const userNameContainer = card.querySelector('div[data-testid="User-Name"]');
-        if (userNameContainer) {
-            const spans = Array.from(userNameContainer.querySelectorAll('span'));
-            // Handle: span whose text looks like "@username".
-            const handleSpan = spans.find(el => /^@[A-Za-z0-9_]{1,15}$/.test((el.innerText || el.textContent || '').trim()));
-            if (handleSpan) {
-                authorHandle = (handleSpan.innerText || handleSpan.textContent || '').trim();
-            }
-            // Name: first non-empty span that is not the handle and does not start with "@".
-            const nameSpan = spans.find(el => {
-                const t = (el.innerText || el.textContent || '').trim();
-                if (!t) return false;
-                if (t === authorHandle) return false;
-                if (t.startsWith('@')) return false;
-                return true;
-            });
-            if (nameSpan) {
-                authorName = (nameSpan.innerText || nameSpan.textContent || '').trim();
-            }
-        }
-
-        const quoteData = {
-            id: tweetId,
-            authorName,
-            authorHandle,
-            authorAvatarUrl: normalizeAvatarUrlTo200x200(extractAvatarUrl(card) || ''),
-            authorAvatarFile: '',
-            photoFiles: extractTweetPhotoFilenames(card),
-            videoFiles: (() => {
-                const restId = extractRestIdFromStatusUrl(tweetId);
-                if (!restId) return [];
-                const set = videoFilesByRestId.get(restId);
-                return set ? Array.from(set) : [];
-            })(),
-            isVoicePost: (() => {
-                const restId = extractRestIdFromStatusUrl(tweetId);
-                return !!(restId && voiceDetectedByRestId.get(restId));
-            })(),
-            text: extractTweetTextWithEmojis(tweetTextElement) || '',
-            timestamp: timeElement?.getAttribute('datetime') || ''
-        };
-
-        // Determine a stable local avatar filename for markdown linking + export list.
-        quoteData.authorAvatarFile = avatarFilenameFromUrlAndHandle(
-            quoteData.authorAvatarUrl,
-            quoteData.authorHandle
-        );
-
-        return quoteData;
-    }
-
-    function emojiUnicodeFromTwitterUrl(src) {
-        if (!src) return null;
-
-        // 2) Parse codepoints from URL filename: .../emoji/v2/svg/1f9e0.svg or 1f3f3-fe0f-200d-1f308.svg
-        const match = src.match(/\/emoji\/v2\/svg\/([0-9a-f-]+)\.svg/i);
-        if (!match) return null;
-
-        const codepoints = match[1]
-            .toLowerCase()
-            .split('-')
-            .filter(Boolean)
-            .map(hex => Number.parseInt(hex, 16));
-
-        if (codepoints.length === 0 || codepoints.some(n => !Number.isFinite(n))) return null;
-
-        try {
-            return String.fromCodePoint(...codepoints);
-        } catch {
-            return null;
-        }
-    }
-
-    function toEmojiTextOrMarkdown(imgEl) {
-        const alt = imgEl?.getAttribute?.('alt') || imgEl?.getAttribute?.('title') || '';
-        const src = imgEl?.getAttribute?.('src') || '';
-
-        // Primary: generate Unicode directly from the Twitter emoji SVG URL.
-        const unicode = emojiUnicodeFromTwitterUrl(src);
-        if (unicode) return unicode;
-
-        // Secondary: Twitter often already provides the Unicode in `alt`.
-        if (alt) return alt;
-
-        // Fallback: do NOT emit markdown image syntax here, because tweet body text
-        // gets markdown-escaped for Obsidian/CommonMark (which would break it).
-        // If we can't map the emoji, just keep a placeholder.
-        return 'emoji';
-    }
-
-    function extractTweetTextWithEmojis(rootEl) {
-        if (!rootEl) return '';
-
-        const out = [];
-
-        // Some translation extensions (e.g. Immersive Translate) inject translated content
-        // as a sibling or wrapper around the original tweet text. Prefer scraping the
-        // translated node (if present) instead of the original.
-        const translatedInner = getImmersiveTranslateContentNode(rootEl);
-        const effectiveRoot = translatedInner || rootEl;
-
-        const walk = (node) => {
-            if (!node) return;
-
-            // Text node
-            if (node.nodeType === Node.TEXT_NODE) {
-                out.push(node.textContent || '');
-                return;
-            }
-
-            // Element node
-            if (node.nodeType === Node.ELEMENT_NODE) {
-                const el = /** @type {HTMLElement} */ (node);
-                const tag = (el.tagName || '').toUpperCase();
-
-                // Skip hidden/aria-hidden nodes (translation tools often inject hidden separators).
-                if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true') {
-                    return;
-                }
-
-                if (tag === 'IMG') {
-                    out.push(toEmojiTextOrMarkdown(el));
-                    return;
-                }
-
-                if (tag === 'BR') {
-                    // Ignore hidden <br> (common in injected translation wrappers).
-                    if (el.hasAttribute('hidden')) return;
-                    out.push('\n');
-                    return;
-                }
-
-                // Recurse children
-                el.childNodes.forEach(walk);
-            }
-        };
-
-        walk(effectiveRoot);
-        return out.join('');
-    }
-
-    function getImmersiveTranslateContentNode(rootEl) {
-        if (!rootEl) return null;
-
-        // Core Immersive Translate content markers. These cover both block and inline
-        // translation containers as used in the upstream extension.
-        const TRANSLATION_SELECTOR = [
-            '.immersive-translate-target-inner',
-            '.immersive-translate-target-translation-block-wrapper',
-            '.immersive-translate-target-translation-inline-wrapper',
-            '.immersive-translate-target-translation-vertical-block-wrapper',
-            '.immersive-translate-target-translation-pre-whitespace',
-            '.immersive-translate-target-translation-pdf-block-wrapper',
-            '[data-immersive-translate-translation-element-mark]'
-        ].join(', ');
-
-        // 1) Direct hits on the node itself or its descendants.
-        if (rootEl.matches?.(TRANSLATION_SELECTOR)) return rootEl;
-        const direct = rootEl.querySelector?.(TRANSLATION_SELECTOR);
-        if (direct) return direct;
-
-        // 2) Immersive sometimes injects translated DOM as a sibling or wrapper around
-        // the original text node. Look at nearby siblings under the same parent.
-        const parent = rootEl.parentElement;
-        if (parent) {
-            for (let node = parent.firstElementChild; node; node = node.nextElementSibling) {
-                if (node === rootEl) continue;
-                if (node.matches?.(TRANSLATION_SELECTOR)) return node;
-                const nested = node.querySelector?.(TRANSLATION_SELECTOR);
-                if (nested) return nested;
-            }
-        }
-
-        // 3) Walk up to a nearby Immersive wrapper that might contain both original
-        // and translated content, then search within it.
-        const wrapper = rootEl.closest?.(
-            '.immersive-translate-target-wrapper, [data-immersive-translate-paragraph]'
-        );
-        if (wrapper) {
-            if (wrapper.matches?.(TRANSLATION_SELECTOR)) return wrapper;
-            const nested = wrapper.querySelector?.(TRANSLATION_SELECTOR);
-            if (nested) return nested;
-        }
-
-        return null;
-    }
-
-    function isImmersiveTranslateActiveOnPage() {
-        // Best-effort: if the extension isn't installed/active, don't add unnecessary waits.
-        return !!document.querySelector(
-            [
-                '.immersive-translate-target-wrapper',
-                '.immersive-translate-target-inner',
-                '.immersive-translate-target-translation-block-wrapper',
-                '.immersive-translate-target-translation-inline-wrapper',
-                '.immersive-translate-target-translation-vertical-block-wrapper',
-                '.immersive-translate-target-translation-pre-whitespace',
-                '.immersive-translate-target-translation-pdf-block-wrapper',
-                '[data-immersive-translate-translation-element-mark]',
-                '[data-immersive-translate-paragraph]'
-            ].join(', ')
-        );
-    }
+    // Avatar/media filename helpers now live in `tweet-parser.js` (getTweetIdFromTweetEl,
+    // extractAvatarUrl, normalizeAvatarUrlTo200x200, avatarFilenameFromUrlAndHandle,
+    // normalizeTwitterMediaFilenameFromUrl, sanitizeFilenameComponent).
+
+    // Tweet DOM parsing helpers now live in `tweet-parser.js` (extractTweetPhotoFilenames,
+    // extractPollFromTweetElement, findQuoteCardElements, extractQuoteTweetFromTweetElement,
+    // emojiUnicodeFromTwitterUrl, toEmojiTextOrMarkdown, extractTweetTextWithEmojis,
+    // getImmersiveTranslateContentNode, isImmersiveTranslateActiveOnPage).
 
     function getUnscrapedTweetTextElements(limit = 12) {
         const out = [];
@@ -2434,10 +1613,65 @@
         // Periodically trim very old deferrals so long-running sessions don't accumulate them.
         cleanupStaleTranslationDeferrals(maxWait * 3);
         const start = Date.now();
+        let lastPendingCount = 0;
         while (Date.now() - start < maxWait) {
             const pending = getDeferredUnscrapedTweetTextElements(12);
             if (pending.length === 0) return;
+            lastPendingCount = pending.length;
             await sleep(TRANSLATION_POLL_MS);
+        }
+
+        // If we still have deferred tweets after the wait window on a status page and a translation
+        // plugin looks active, treat this as a translation stall so we can abort a search run early.
+        try {
+            const pending = getDeferredUnscrapedTweetTextElements(12);
+            if (
+                currentRunMode === 'status' &&
+                waitForImmersiveTranslate &&
+                isImmersiveTranslateActiveOnPage?.() &&
+                pending.length > 0 &&
+                untranslatedStatusTweetStreak >= 2 &&  // Require 2+ consecutive untranslated tweets
+                !translationStallOnStatusPage
+            ) {
+                translationStallOnStatusPage = true;
+                // Do not permanently remember any tweets from this page so it can be re-scraped later.
+                try {
+                    if (typeof clearRememberedScrapedIdsForCurrentPage === 'function') {
+                        clearRememberedScrapedIdsForCurrentPage();
+                    }
+                } catch {
+                    // ignore ID clearing failures
+                }
+
+                // If this status page is part of an active multi-page search run, cancel it and
+                // bounce back to the search page so the user can retry later.
+                try {
+                    const state = typeof loadSearchRunState === 'function' ? loadSearchRunState() : null;
+                    const isPartOfSearchRun =
+                        !!(state && !state.done && state.mode === 'search' && Array.isArray(state.tweetQueue) && state.tweetQueue.length > 0);
+                    if (isPartOfSearchRun && typeof cancelSearchRun === 'function') {
+                        setUiStatus('Translation appears stuck; cancelling search run and returning to search page…');
+                        cancelSearchRun();
+                        return;
+                    }
+                } catch {
+                    // ignore search-run cancellation failures
+                }
+
+                // Fallback: stop scraping and reload the current page to clear any stuck state.
+                try {
+                    stopScrapingInterval('Translation appears stuck; stopping scraper and reloading page…');
+                } catch {
+                    // ignore
+                }
+                try {
+                    window.location.reload();
+                } catch {
+                    // ignore reload failures
+                }
+            }
+        } catch {
+            // ignore translation-stall handling errors
         }
     }
 
@@ -2538,6 +1772,8 @@
         // Seed dedupe with remembered IDs (so we can skip tweets scraped in prior sessions).
         scrapedIdSet = rememberScrapedIdsEnabled ? new Set(rememberedScrapedIdSet) : new Set();
         translationDeferById = new Map();
+        untranslatedStatusTweetStreak = 0;
+        translationStallOnStatusPage = false;
         startTimelineObserver();
         if (currentRunMode === 'with_replies') {
             console.log(`Scraping started for ${currentRunProfileHandle}'s /with_replies page...`);
@@ -2547,7 +1783,12 @@
             console.log(`Scraping started (page mode: ${currentRunMode})...`);
         }
         // Reset per-run media/voice caches populated by network interceptors.
-        clearPerRunMediaCaches();
+        // On standalone /status pages, keep any media discovered during initial page load,
+        // since Twitter may not fire new GraphQL requests after scraping starts (which would
+        // otherwise leave `videoFilesByRestId` empty and lose video filenames).
+        if (currentRunMode !== 'status') {
+            clearPerRunMediaCaches();
+        }
         // Gate extraction until we hit the selected start tweet, if any.
         // NOTE: On /status pages, "start tweet" gating is not useful and can cause the root tweet to be skipped.
         hasReachedStartTweet = (currentRunMode === 'status') ? true : !startFromTweetId;
@@ -2747,7 +1988,9 @@
             }
 
             const tweetTextElement = tweet.querySelector('[data-testid="tweetText"]');
-            const timeElement = tweet.querySelector('time');
+            const timeElement = (typeof pickBestTweetTimeElement === 'function')
+                ? pickBestTweetTimeElement(tweet)
+                : tweet.querySelector('time');
 
             // If we're trying to capture Immersive Translate output, avoid "locking in" the original text
             // before the extension injects its translated subtree.
@@ -2775,6 +2018,13 @@
             // Detect whether this tweet currently has translated content injected.
             const hasTranslatedNode = !!(tweetTextElement && getImmersiveTranslateContentNode(tweetTextElement));
 
+            const restIdForTweet = extractRestIdFromStatusUrl(tweetId);
+            const hasNetworkVoice = !!(restIdForTweet && voiceDetectedByRestId.get(restIdForTweet));
+            const hasDomVoice =
+                typeof domTweetLooksLikeVoicePost === 'function'
+                    ? domTweetLooksLikeVoicePost(tweet)
+                    : !!tweet.querySelector('[aria-label="Voice post"], [aria-label*="Voice post"], [aria-label*="voice"]');
+
             const tweetData = {
                 id: tweetId,
                 authorName: tweet.querySelector('div[data-testid="User-Name"] a:not([tabindex="-1"]) span span')?.innerText || '',
@@ -2783,15 +2033,11 @@
                 authorAvatarFile: '', // computed below
                 photoFiles: extractTweetPhotoFilenames(tweet),
                 videoFiles: (() => {
-                    const restId = extractRestIdFromStatusUrl(tweetId);
-                    if (!restId) return [];
-                    const set = videoFilesByRestId.get(restId);
+                    if (!restIdForTweet) return [];
+                    const set = videoFilesByRestId.get(restIdForTweet);
                     return set ? Array.from(set) : [];
                 })(),
-                isVoicePost: (() => {
-                    const restId = extractRestIdFromStatusUrl(tweetId);
-                    return !!(restId && voiceDetectedByRestId.get(restId));
-                })(),
+                isVoicePost: hasNetworkVoice || hasDomVoice,
                 // `innerText` drops emoji <img> nodes; walk the tweetText DOM to preserve them.
                 text: extractTweetTextWithEmojis(tweetTextElement) || '',
                 timestamp: timeElement?.getAttribute('datetime') || '',
@@ -2831,14 +2077,16 @@
                 tweetData.poll = null;
             }
 
-            // If this tweet was detected as a voice post, store its URL for yt-dlp export.
-            if (tweetData.isVoicePost) {
-                const restId = extractRestIdFromStatusUrl(tweetId);
-                if (restId) {
-                    let set = voiceTweetUrlsByRestId.get(restId);
-                    if (!set) { set = new Set(); voiceTweetUrlsByRestId.set(restId, set); }
-                    set.add(tweetId);
+            // If this tweet was detected as a voice post, store its URL for yt-dlp export
+            // and ensure the rest_id voice flag is set even when detection came from DOM.
+            if (tweetData.isVoicePost && restIdForTweet) {
+                voiceDetectedByRestId.set(restIdForTweet, true);
+                let set = voiceTweetUrlsByRestId.get(restIdForTweet);
+                if (!set) {
+                    set = new Set();
+                    voiceTweetUrlsByRestId.set(restIdForTweet, set);
                 }
+                set.add(tweetId);
             }
 
             if (autoHarvestWithExtension) {
@@ -2849,6 +2097,19 @@
 
             scrapedData.push(tweetData);
             scrapedIdSet.add(tweetId);
+
+            // On status pages with translation waiting enabled, track a streak of tweets that
+            // never received translated content. If many consecutive tweets are scraped without
+            // translation while a translation plugin appears active, we assume it is stuck and
+            // will cancel the run to avoid the tab hanging.
+            if (currentRunMode === 'status' && waitForImmersiveTranslate && isImmersiveTranslateActiveOnPage?.()) {
+                if (tweetData.isVoicePost || tweetData.isTranslated) {
+                    // Consider voice-only tweets or successfully translated tweets as "healthy".
+                    untranslatedStatusTweetStreak = 0;
+                } else {
+                    untranslatedStatusTweetStreak++;
+                }
+            }
             // Only persist into the cross-run "remembered" set if either:
             //  - we're not waiting for Immersive Translate, or
             //  - the translation extension isn't active, or
@@ -3044,7 +2305,9 @@
                         }
 
                         const tweetTextElement = article.querySelector('[data-testid="tweetText"]');
-                        const timeElement = article.querySelector('time');
+                        const timeElement = (typeof pickBestTweetTimeElement === 'function')
+                            ? pickBestTweetTimeElement(article)
+                            : article.querySelector('time');
 
                         const statsGroup = article.querySelector('div[role="group"][aria-label]');
                         let hasReplies = false;
@@ -3056,6 +2319,16 @@
 
                         const hasTranslatedNode =
                             !!(tweetTextElement && getImmersiveTranslateContentNode(tweetTextElement));
+
+                        const restIdForFallback = extractRestIdFromStatusUrl(tweetId);
+                        const hasNetworkVoiceFallback =
+                            !!(restIdForFallback && voiceDetectedByRestId.get(restIdForFallback));
+                        const hasDomVoiceFallback =
+                            typeof domTweetLooksLikeVoicePost === 'function'
+                                ? domTweetLooksLikeVoicePost(article)
+                                : !!article.querySelector(
+                                      '[aria-label="Voice post"], [aria-label*="Voice post"], [aria-label*="voice"]'
+                                  );
 
                         const tweetData = {
                             id: tweetId,
@@ -3071,15 +2344,11 @@
                             authorAvatarFile: '',
                             photoFiles: extractTweetPhotoFilenames(article),
                             videoFiles: (() => {
-                                const restId = extractRestIdFromStatusUrl(tweetId);
-                                if (!restId) return [];
-                                const set = videoFilesByRestId.get(restId);
+                                if (!restIdForFallback) return [];
+                                const set = videoFilesByRestId.get(restIdForFallback);
                                 return set ? Array.from(set) : [];
                             })(),
-                            isVoicePost: (() => {
-                                const restId = extractRestIdFromStatusUrl(tweetId);
-                                return !!(restId && voiceDetectedByRestId.get(restId));
-                            })(),
+                            isVoicePost: hasNetworkVoiceFallback || hasDomVoiceFallback,
                             text: extractTweetTextWithEmojis(tweetTextElement) || '',
                             timestamp: timeElement?.getAttribute('datetime') || '',
                             isReply: false,
@@ -3394,7 +2663,26 @@
                         break;
                     }
                 }
+                return;
             }
+
+            // Owner tweets that are not clearly paired to a non-owner (e.g. self-replies or
+            // additional "part 2" style posts) should still be included instead of being dropped.
+            // Treat them as their own small "owner thread" so they appear in the final markdown.
+            const ownerKey = ownerHandle || tweet.authorHandle || '';
+            if (!threadsByHandle.has(ownerKey)) {
+                threadsByHandle.set(ownerKey, []);
+                firstSeenHandles.push(ownerKey);
+            }
+
+            const ownerParentTweet = {
+                ...tweet,
+                isParent: true,
+                hasReply: false,
+                replyIds: []
+            };
+
+            threadsByHandle.get(ownerKey).push(ownerParentTweet);
         });
 
         // Convert to threads and sort chronologically within each thread.
@@ -3595,6 +2883,10 @@
         }
 
         // If this tweet embeds a quoted tweet, append an Obsidian [!Quote] callout block.
+        // Note: Media for the *outer* tweet should appear *before* this quote block in the
+        // markdown so that screenshots / videos feel visually attached to the main text
+        // rather than buried inside the quote. Media rendering for the outer tweet lives
+        // below; the ordering is controlled by where we append to `content` here.
         if (tweet.quote) {
             const q = tweet.quote;
             const quoteIndent = indent;
@@ -3662,6 +2954,19 @@
 
         // Append Obsidian image embeds for downloaded media filenames (safe even if file isn't present yet).
         // Example: ![[G74vDW1bEAAT6aD.jpg|400]]
+        //
+        // For nicer reading order, we want media from the *outer* tweet to appear immediately
+        // after the tweet text but *before* any quoted-tweet callout. That layout is controlled
+        // by where this block sits relative to the quote block above. Since we append to
+        // `content` in sequence, keeping this media section *above* the quote block will ensure
+        // media renders first; keeping it *below* causes the quote to appear before media.
+        //
+        // To satisfy the desired layout:
+        //   - tweet header + text
+        //   - outer tweet media (photos/videos)
+        //   - quote callout block
+        //
+        // we ensure media is inserted here *before* we append the quote callout block above.
         if (Array.isArray(tweet.photoFiles) && tweet.photoFiles.length > 0) {
             const width = 400;
             const embeds = tweet.photoFiles

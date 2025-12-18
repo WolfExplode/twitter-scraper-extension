@@ -3,17 +3,67 @@
 // Exporter helpers: markdown + ID / media export utilities.
 // Depends on core helpers defined in `scraper.js` (e.g. formatTweet, extractRestIdFromStatusUrl, etc.).
 
+function prefixBlockquoteToTweetMarkdown(block) {
+    // Given the markdown for a single tweet (as returned by `formatTweet`),
+    // prefix each non-empty line with a leading `>` so it renders as part of
+    // an existing Obsidian callout / blockquote.
+    //
+    // Important:
+    // - We skip lines that already begin with `>` so we don't double-nest.
+    // - We preserve leading tabs/spaces *after* the `> ` so indentation is kept.
+    const lines = String(block || '').split('\n');
+    const out = lines.map(line => {
+        if (!line) return line;
+        if (/^\s*>/.test(line)) return line;
+        return `> ${line}`;
+    });
+    return out.join('\n');
+}
+
 function generateMarkdown(tweets, filename) {
     let mdContent = '';
-    
+    // When a root tweet (depth 0) contains a quote, we add a horizontal rule
+    // after its callout. For readability, we also want the *first-level* replies
+    // that follow to be rendered flush-left (no leading tab), while keeping
+    // deeper replies indented. We track that with a simple flag.
+    let quoteIndentOffsetActive = false;
+
     tweets.forEach(tweet => {
         if (tweet.separator) {
-            mdContent += '\n'; // Blank line between root tweets
-        } else {
-            mdContent += formatTweet(tweet);
+            mdContent += '\n';
+            quoteIndentOffsetActive = false;
+            return;
+        }
+
+        // Any new root tweet ends the indentation offset from a previous quote.
+        if (tweet.depth === 0) {
+            quoteIndentOffsetActive = false;
+        }
+
+        // After a root+quote, drop one level of indentation for replies so that
+        // depth-1 tweets render without a leading tab, and depth-2 tweets render
+        // with a single tab (etc.).
+        let effectiveTweet = tweet;
+        if (quoteIndentOffsetActive && typeof tweet.depth === 'number' && tweet.depth > 0) {
+            effectiveTweet = {
+                ...tweet,
+                depth: Math.max(0, (tweet.depth || 0) - 1)
+            };
+        }
+
+        let block = formatTweet(effectiveTweet);
+
+        mdContent += block;
+
+        // For quote tweets, add a horizontal rule immediately after the quote
+        // callout block so that subsequent replies render as normal tweets
+        // outside the callout (matching the desired layout).
+        if (tweet.depth === 0 && tweet.quote) {
+            mdContent += '---\n';
+            quoteIndentOffsetActive = true;
         }
     });
-    
+
     downloadMarkdown(mdContent, filename);
 }
 
@@ -265,5 +315,4 @@ function downloadTextFile(content, filename) {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 }
-
 
