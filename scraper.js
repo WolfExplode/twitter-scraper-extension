@@ -574,8 +574,9 @@
         const seen = new Set();
         const articles = document.querySelectorAll('article[data-testid="tweet"]');
         for (let i = 0; i < articles.length && urls.length < max; i++) {
-            const a = articles[i].querySelector('a[href*="/status/"]');
-            const id = normalizeStatusUrl(a?.href || '');
+            const id = (typeof getTweetIdFromTweetEl === 'function')
+                ? getTweetIdFromTweetEl(articles[i])
+                : normalizeStatusUrl(articles[i].querySelector('a[href*="/status/"]')?.href || '');
             if (!id) continue;
             if (scrapedIdSet.has(id) || rememberedScrapedIdSet.has(id)) continue;
             if (seen.has(id)) continue;
@@ -728,8 +729,9 @@
 
         const tweetEls = document.querySelectorAll('article[data-testid="tweet"]');
         for (const tweetEl of tweetEls) {
-            const tweetLinkElement = tweetEl.querySelector('a[href*="/status/"]');
-            const tweetId = normalizeStatusUrl(tweetLinkElement?.href);
+            const tweetId = (typeof getTweetIdFromTweetEl === 'function')
+                ? getTweetIdFromTweetEl(tweetEl)
+                : normalizeStatusUrl(tweetEl.querySelector('a[href*="/status/"]')?.href);
             if (tweetId && (scrapedIdSet.has(tweetId) || rememberedScrapedIdSet.has(tweetId))) {
                 applyScrapedHighlight(tweetEl);
             }
@@ -827,10 +829,11 @@
         // this page without wiping history for other tweets/accounts.
         const idsOnPage = new Set();
         try {
-            const links = document.querySelectorAll('article[data-testid="tweet"] a[href*="/status/"]');
-            links.forEach(a => {
-                const href = a?.href || a?.getAttribute?.('href') || '';
-                const id = normalizeStatusUrl(href);
+            const tweetEls = document.querySelectorAll('article[data-testid="tweet"]');
+            tweetEls.forEach(tweetEl => {
+                const id = (typeof getTweetIdFromTweetEl === 'function')
+                    ? getTweetIdFromTweetEl(tweetEl)
+                    : normalizeStatusUrl(tweetEl.querySelector('a[href*="/status/"]')?.href || '');
                 if (id) idsOnPage.add(id);
             });
         } catch {
@@ -1516,8 +1519,9 @@
         const tweetEls = document.querySelectorAll('article[data-testid="tweet"]');
         for (let i = 0; i < tweetEls.length && out.length < limit; i++) {
             const tweet = tweetEls[i];
-            const tweetLinkElement = tweet.querySelector('a[href*="/status/"]');
-            const tweetId = normalizeStatusUrl(tweetLinkElement?.href);
+            const tweetId = (typeof getTweetIdFromTweetEl === 'function')
+                ? getTweetIdFromTweetEl(tweet)
+                : normalizeStatusUrl(tweet.querySelector('a[href*="/status/"]')?.href);
             if (!tweetId || scrapedIdSet.has(tweetId)) continue;
             const tweetTextElement = tweet.querySelector('[data-testid="tweetText"]');
             if (!tweetTextElement) continue;
@@ -1580,8 +1584,9 @@
 
         for (let i = 0; i < tweetEls.length && out.length < limit; i++) {
             const tweet = tweetEls[i];
-            const tweetLinkElement = tweet.querySelector('a[href*="/status/"]');
-            const tweetId = normalizeStatusUrl(tweetLinkElement?.href);
+            const tweetId = (typeof getTweetIdFromTweetEl === 'function')
+                ? getTweetIdFromTweetEl(tweet)
+                : normalizeStatusUrl(tweet.querySelector('a[href*="/status/"]')?.href);
             if (!tweetId || scrapedIdSet.has(tweetId)) continue;
 
             const entry = translationDeferById.get(tweetId);
@@ -1975,8 +1980,9 @@
                 return;
             }
 
-            const tweetLinkElement = tweet.querySelector('a[href*="/status/"]');
-            const tweetId = normalizeStatusUrl(tweetLinkElement?.href);
+            const tweetId = (typeof getTweetIdFromTweetEl === 'function')
+                ? getTweetIdFromTweetEl(tweet)
+                : normalizeStatusUrl(tweet.querySelector('a[href*="/status/"]')?.href);
 
             if (!tweetId || scrapedIdSet.has(tweetId)) return;
 
@@ -2295,8 +2301,9 @@
                         const locUrl = getNormalizedCurrentStatusUrl();
                         const locRestId = extractRestIdFromStatusUrl(locUrl);
 
-                        const linkEl = article.querySelector('a[href*="/status/"]');
-                        const hrefUrl = normalizeStatusUrl(linkEl?.href || '');
+                        const hrefUrl = (typeof getTweetIdFromTweetEl === 'function')
+                            ? getTweetIdFromTweetEl(article)
+                            : normalizeStatusUrl(article.querySelector('a[href*="/status/"]')?.href || '');
                         const hrefRestId = extractRestIdFromStatusUrl(hrefUrl);
 
                         let tweetId = locUrl || hrefUrl || '';
@@ -2830,10 +2837,29 @@
         const safeHandle = escapeMarkdownInlineText(tweet.authorHandle);
         let content = `${indent}${avatarMd}**${safeHandle}** ${dateLink}`;
 
-        const textLines = stripYouTubeUrlsFromLines(String(tweet.text || '').split("\n"));
-        if (textLines.length > 0 && textLines[0].trim()) {
+        const splitTrailingHashtagLines = (lines) => {
+            // If the tweet ends with one or more hashtag-only lines, keep those as a trailing block
+            // so we can render media before the hashtag pile (better readability).
+            if (!Array.isArray(lines) || lines.length === 0) return { body: [], tail: [] };
+            let cut = lines.length;
+            for (let i = lines.length - 1; i >= 0; i--) {
+                const t = String(lines[i] || '').trim();
+                if (!t) continue;
+                if (/^#\S+/.test(t)) {
+                    cut = i;
+                    continue;
+                }
+                break;
+            }
+            return {
+                body: lines.slice(0, cut),
+                tail: lines.slice(cut)
+            };
+        };
+
+        const renderTweetTextLines = (lines) => {
             const textIndent = indent;
-            const renderedLines = textLines
+            const renderedLines = (lines || [])
                 .map(stripYouTubeUrlsFromLine)
                 // NOTE: This intentionally removes *blank lines* from tweet text.
                 // Twitter often includes empty lines in `innerText` (double newlines) for spacing.
@@ -2845,10 +2871,18 @@
                     const safeLine = escapeMarkdownInlineTextPreservingUrls(formattedLine);
                     return `${textIndent}${safeLine}`;
                 });
-
             if (renderedLines.length > 0) {
                 content += "\n" + renderedLines.join("\n");
             }
+        };
+
+        const textLines = stripYouTubeUrlsFromLines(String(tweet.text || '').split("\n"));
+        const { body: bodyTextLines, tail: tailTextLines } = splitTrailingHashtagLines(textLines);
+        if (bodyTextLines.length > 0 && bodyTextLines[0].trim()) {
+            renderTweetTextLines(bodyTextLines);
+        } else if (textLines.length > 0 && textLines[0].trim()) {
+            // Fallback: if our split logic produced an empty body but there is text, render it all.
+            renderTweetTextLines(textLines);
         }
 
         // If this tweet contains an embedded poll, render it as a compact markdown block.
@@ -2882,11 +2916,44 @@
             }
         }
 
-        // If this tweet embeds a quoted tweet, append an Obsidian [!Quote] callout block.
-        // Note: Media for the *outer* tweet should appear *before* this quote block in the
-        // markdown so that screenshots / videos feel visually attached to the main text
-        // rather than buried inside the quote. Media rendering for the outer tweet lives
-        // below; the ordering is controlled by where we append to `content` here.
+        // Append Obsidian image embeds for downloaded media filenames (safe even if file isn't present yet).
+        // Example: ![[G74vDW1bEAAT6aD.jpg|400]]
+        if (Array.isArray(tweet.photoFiles) && tweet.photoFiles.length > 0) {
+            const width = 400;
+            const embeds = tweet.photoFiles
+                .filter(Boolean)
+                .map(name => `${indent}![[${name}|${width}]]`);
+            if (embeds.length > 0) {
+                content += "\n" + embeds.join("\n");
+            }
+        }
+
+        // Append Obsidian video embeds (stable filenames derived from video.twimg.com URLs).
+        // Example: ![[Uh8iwW-Dw2JmvwBF.mp4|vid-20]]
+        if (Array.isArray(tweet.videoFiles) && tweet.videoFiles.length > 0) {
+            const embeds = tweet.videoFiles
+                .filter(Boolean)
+                .map(name => `${indent}![[${name}|vid-20]]`);
+            if (embeds.length > 0) {
+                content += "\n" + embeds.join("\n");
+            }
+        }
+
+        // Voice posts: the download is handled via yt-dlp (exported as *_voice_ytdlp.ps1).
+        // We embed a deterministic filename that the PS1 script will produce: voice_<tweetId>.m4a
+        if (tweet.isVoicePost && tweet.id) {
+            const restId = extractRestIdFromStatusUrl(tweet.id);
+            if (restId) {
+                content += `\n${indent}![[voice_${restId}.m4a|aud]]`;
+            }
+        }
+
+        // Render trailing hashtags (if any) after media for readability.
+        if (tailTextLines && tailTextLines.length > 0) {
+            renderTweetTextLines(tailTextLines);
+        }
+
+        // If this tweet embeds a quoted tweet, append an Obsidian [!Quote] callout block last.
         if (tweet.quote) {
             const q = tweet.quote;
             const quoteIndent = indent;
@@ -2949,51 +3016,6 @@
 
             if (lines.length > 0) {
                 content += "\n" + lines.join("\n");
-            }
-        }
-
-        // Append Obsidian image embeds for downloaded media filenames (safe even if file isn't present yet).
-        // Example: ![[G74vDW1bEAAT6aD.jpg|400]]
-        //
-        // For nicer reading order, we want media from the *outer* tweet to appear immediately
-        // after the tweet text but *before* any quoted-tweet callout. That layout is controlled
-        // by where this block sits relative to the quote block above. Since we append to
-        // `content` in sequence, keeping this media section *above* the quote block will ensure
-        // media renders first; keeping it *below* causes the quote to appear before media.
-        //
-        // To satisfy the desired layout:
-        //   - tweet header + text
-        //   - outer tweet media (photos/videos)
-        //   - quote callout block
-        //
-        // we ensure media is inserted here *before* we append the quote callout block above.
-        if (Array.isArray(tweet.photoFiles) && tweet.photoFiles.length > 0) {
-            const width = 400;
-            const embeds = tweet.photoFiles
-                .filter(Boolean)
-                .map(name => `${indent}![[${name}|${width}]]`);
-            if (embeds.length > 0) {
-                content += "\n" + embeds.join("\n");
-            }
-        }
-
-        // Append Obsidian video embeds (stable filenames derived from video.twimg.com URLs).
-        // Example: ![[Uh8iwW-Dw2JmvwBF.mp4|vid-20]]
-        if (Array.isArray(tweet.videoFiles) && tweet.videoFiles.length > 0) {
-            const embeds = tweet.videoFiles
-                .filter(Boolean)
-                .map(name => `${indent}![[${name}|vid-20]]`);
-            if (embeds.length > 0) {
-                content += "\n" + embeds.join("\n");
-            }
-        }
-
-        // Voice posts: the download is handled via yt-dlp (exported as *_voice_ytdlp.ps1).
-        // We embed a deterministic filename that the PS1 script will produce: voice_<tweetId>.m4a
-        if (tweet.isVoicePost && tweet.id) {
-            const restId = extractRestIdFromStatusUrl(tweet.id);
-            if (restId) {
-                content += `\n${indent}![[voice_${restId}.m4a|aud]]`;
             }
         }
 

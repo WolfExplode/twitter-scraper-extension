@@ -6,8 +6,67 @@
 // - It only defines functions; behaviour runs when called from `scraper.js`.
 
 function getTweetIdFromTweetEl(tweetEl) {
-    const a = tweetEl?.querySelector?.('a[href*="/status/"]');
+    const a = pickBestTweetPermalinkAnchor(tweetEl);
     return normalizeStatusUrl(a?.href || '');
+}
+
+// Pick the *outer* tweet permalink anchor from an article element.
+//
+// Why: quote-tweet layouts embed additional `/status/...` links (quoted tweet permalinks,
+// photo links like `/status/<id>/photo/1`, etc). `querySelector('a[href*="/status/"]')`
+// often returns the *quoted* tweet instead of the outer tweet.
+function pickBestTweetPermalinkAnchor(tweetEl) {
+    if (!tweetEl || !tweetEl.querySelectorAll) return null;
+
+    /** @type {HTMLElement[]} */
+    const quoteCards = (typeof findQuoteCardElements === 'function')
+        ? (findQuoteCardElements(tweetEl) || [])
+        : [];
+
+    const isInsideQuoteCard = (node) => {
+        if (!node || !quoteCards || quoteCards.length === 0) return false;
+        for (const card of quoteCards) {
+            if (card && card.contains(node)) return true;
+        }
+        return false;
+    };
+
+    const anchors = Array.from(tweetEl.querySelectorAll('a[href*="/status/"]'));
+    if (anchors.length === 0) return null;
+
+    // Only keep anchors that actually contain a tweet rest_id.
+    const withRestId = anchors.filter(a => {
+        const href = a?.href || a?.getAttribute?.('href') || '';
+        return !!extractRestIdFromStatusUrl(href);
+    });
+
+    const candidates = (withRestId.length > 0 ? withRestId : anchors)
+        .filter(a => !isInsideQuoteCard(a));
+
+    if (candidates.length === 0) return withRestId[0] || anchors[0] || null;
+
+    // 1) Prefer anchors that wrap a real tweet timestamp (<time datetime="YYYY-MM-DD...">).
+    const withIsoTime = candidates.filter(a => {
+        const t = a.querySelector?.('time[datetime]');
+        const dt = t?.getAttribute?.('datetime') || '';
+        return /^\d{4}-\d{2}-\d{2}T/.test(dt);
+    });
+    if (withIsoTime.length > 0) {
+        // If multiple (rare), the outer tweet timestamp tends to appear later than the quoted card.
+        return withIsoTime[withIsoTime.length - 1];
+    }
+
+    // 2) Next: prefer canonical status URLs (not `/photo/1`, `/video/1`, etc).
+    const canonical = candidates.filter(a => {
+        const href = a?.href || '';
+        return /\/status\/\d+\/?$/.test(href);
+    });
+    if (canonical.length > 0) {
+        return canonical[canonical.length - 1];
+    }
+
+    // 3) Fallback: last non-quote candidate (outer tweet content typically appears after quote card).
+    return candidates[candidates.length - 1] || null;
 }
 
 function extractAvatarUrl(tweetEl) {
@@ -142,17 +201,21 @@ function normalizeTwitterMediaFilenameFromUrl(urlString) {
     }
 }
 
-function extractTweetPhotoFilenames(tweetEl) {
+function extractTweetPhotoFilenames(tweetEl, options = {}) {
     // Collect filenames that match how your downloader saves them (e.g. G74vDW1bEAAT6aD.jpg).
     // For top-level tweets that contain a quoted-tweet card, we *exclude* media that lives
     // inside the quote card; that media is attached to the quoted tweet instead.
     if (!tweetEl) return [];
 
+    const excludeQuoteCardMedia = options?.excludeQuoteCardMedia !== false;
+
     const out = new Set();
 
     // Pre-compute any embedded quote card containers so we can skip media inside them.
-    const quoteCardEls = findQuoteCardElements?.(tweetEl) || [];
+    // NOTE: For extracting media from the quote card *itself*, callers can disable this.
+    const quoteCardEls = excludeQuoteCardMedia ? (findQuoteCardElements?.(tweetEl) || []) : [];
     const isInsideQuoteCard = (node) => {
+        if (!excludeQuoteCardMedia) return false;
         if (!node || quoteCardEls.length === 0) return false;
         for (const card of quoteCardEls) {
             if (card && card.contains(node)) return true;
@@ -432,7 +495,8 @@ function extractQuoteTweetFromTweetElement(tweetEl) {
         authorHandle,
         authorAvatarUrl: normalizeAvatarUrlTo200x200(extractAvatarUrl(card) || ''),
         authorAvatarFile: '',
-        photoFiles: extractTweetPhotoFilenames(card),
+        // Include media inside the quote card itself.
+        photoFiles: extractTweetPhotoFilenames(card, { excludeQuoteCardMedia: false }),
         videoFiles: (() => {
             const restId = extractRestIdFromStatusUrl(tweetId);
             if (!restId) return [];
@@ -652,8 +716,30 @@ function pickBestTweetTimeElement(rootEl) {
     const times = rootEl.querySelectorAll('time[datetime]');
     if (!times || times.length === 0) return null;
 
+    // For outer tweets that contain quote cards, ignore <time> elements inside those cards
+    // (otherwise we may pick the quoted tweet timestamp instead of the outer tweet timestamp).
+    let filteredTimes = Array.from(times);
+    try {
+        if (typeof findQuoteCardElements === 'function') {
+            const quoteCards = findQuoteCardElements(rootEl) || [];
+            if (quoteCards.length > 0) {
+                filteredTimes = filteredTimes.filter(t => {
+                    for (const card of quoteCards) {
+                        if (card && card.contains(t)) return false;
+                    }
+                    return true;
+                });
+            }
+        }
+    } catch {
+        // Best-effort only; if DOM heuristics fail, fall back to unfiltered times below.
+    }
+
+    // If filtering removed everything (e.g. odd DOM), fall back to the original list.
+    const effectiveTimes = filteredTimes.length > 0 ? filteredTimes : Array.from(times);
+
     // 1) Prefer ISO8601-like datetimes that start with a calendar date.
-    for (const t of times) {
+    for (const t of effectiveTimes) {
         const dt = t.getAttribute('datetime') || '';
         if (/^\d{4}-\d{2}-\d{2}T/.test(dt)) {
             return t;
@@ -661,7 +747,7 @@ function pickBestTweetTimeElement(rootEl) {
     }
 
     // 2) Next-best: anything that is *not* an ISO8601 duration (PT...).
-    for (const t of times) {
+    for (const t of effectiveTimes) {
         const dt = t.getAttribute('datetime') || '';
         if (!/^PT/i.test(dt)) {
             return t;
@@ -669,6 +755,6 @@ function pickBestTweetTimeElement(rootEl) {
     }
 
     // 3) Fallback: first <time> element.
-    return times[0] || null;
+    return effectiveTimes[0] || null;
 }
 
